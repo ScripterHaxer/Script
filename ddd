@@ -1,0 +1,1070 @@
+local CollectingAllRemotes = true
+local T = tick()
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+function GetContexts()
+    local gtcx;
+    local stcx; 
+    for i, v in pairs(getgenv()) do
+        if string.find(i, "context") or string.find(i, "identity") then
+            if string.find(i, "get") then
+                gtcx = v
+            elseif string.find(i, "set") then
+                stcx = v
+            end
+        end
+    end
+    return gtcx, stcx
+end
+syn_context_get, syn_context_set = GetContexts()
+
+--[[
+local Id;
+Id = hookmetamethod(game, "__namecall", function(rc, ...)
+    local Args = {...}
+    if getnamecallmethod() == "FireServer" and typeof(Args[1]) == "userdata" then
+        error("?")
+    end
+    return Id(rc, ...)
+end)]]
+
+local ScriptsToProtect = {}
+getgenv().ProtectFromSynFunc = function(Func)
+	if Func then
+		ScriptsToProtect[Func] = true
+		return
+	end
+	ScriptsToProtect[getfenv(2).script] = true
+end
+local OldSynFunc = {};
+function ToWipeOut(OldFunc, NewFunc, indx)
+	if indx then
+		OldSynFunc[indx] = hookfunction(OldFunc, newcclosure(NewFunc))
+	else
+		hookfunction(OldFunc, NewFunc)
+	end
+end
+local ClonedError = clonefunction(error)
+local StoredGetGC = {}
+for i, v in pairs(getgc()) do
+	if typeof(v) == "function" and not is_synapse_function(v) and islclosure(v) then
+		table.insert(StoredGetGC, v)
+	end
+end
+local gfv = getfenv;
+local mr = math.random
+local TTTTT, MessageToReturn2 = pcall(debug.getconstants)
+local StoredFunctionsThatGotReturned = {}
+ToWipeOut(debug.getconstants, function(func)
+	if not func then
+		return ClonedError(MessageToReturn2)
+	end
+	local Result = OldSynFunc[1](func)
+	if Result and (ScriptsToProtect[gfv(func).script] or ScriptsToProtect[func]) then
+		if not StoredFunctionsThatGotReturned[func] then
+			StoredFunctionsThatGotReturned[func] = StoredGetGC[mr(1, #StoredGetGC)]
+		end
+		return OldSynFunc[1](StoredFunctionsThatGotReturned[func])
+	end
+	return Result
+end, 1)
+ToWipeOut(getconstants, debug.getconstants)
+local ty = typeof
+local ti = table.insert
+local tr = table.remove
+ToWipeOut(getgc, function(...)
+	local ReturnedTable = OldSynFunc[2](...)
+	for i = #ReturnedTable, 1, -1 do
+		if typeof(ReturnedTable[i]) == "function" and (ScriptsToProtect[gfv(func).script] or ScriptsToProtect[func]) then
+			tr(ReturnedTable, i)
+		end
+	end
+	return ReturnedTable
+end, 2)
+for i, v in pairs(getgenv()) do
+	if string.find(i, "getgc") and i ~= "getgc" then
+		ToWipeOut(v, getgc)
+	end
+end
+for i = 1, #debug.getconstants(ToWipeOut)-1 do
+    debug.setconstant(ToWipeOut, i, "????")
+end
+
+ProtectFromSynFunc()
+getgenv().IsHidden = function(F)
+	return ScriptsToProtect[getfenv(F).script] and true or false
+end
+
+function GetLastChildOfClass(Par, Ty)
+	local Item = nil
+	for i, v in pairs(Par:GetChildren()) do
+		if v:IsA(Ty) then
+			Item = v
+		end
+	end
+	return Item
+end
+
+function GetChildOfClassAtIndex(Par, Ty, Ind)
+	local ItemNumber = 0
+	for i, v in pairs(Par:GetChildren()) do
+		if v:IsA(Ty) then
+			ItemNumber = ItemNumber + 1
+			if ItemNumber == Ind then
+				return v
+			end
+		end
+	end
+end
+
+function GetAllChildrenOfClass(Par, Ty)
+	local ItemTab = {}
+	for i, v in pairs(Par:GetChildren()) do
+		if v:IsA(Ty) then
+			table.insert(ItemTab, v)
+		end
+	end
+	return ItemTab
+end
+
+function GetLastChildOfParent(Par)
+	items = Par:GetChildren()
+	return item[#items]
+end
+
+SpecialNameCalls = {["GetLastChildOfClass"] = GetLastChildOfClass, ["GetChildOfClassAtIndex"] = GetChildOfClassAtIndex,
+["GetAllChildrenOfClass"] = GetAllChildrenOfClass, ["GetLastChildOfParent"] = GetLastChildOfParent}
+if nc == nil and not pcall(function() return game.MetaRun end) then
+	getgenv().meta = getrawmetatable(game)
+    StoredItemTable = {}
+	LockedVals =  {}
+	getgenv().OnIndexed = {}
+	getgenv().OnNewIndexed = {}
+	getgenv().OnGlobalIndexed = {}
+	getgenv().OnGlobalNewIndexed = {}
+	getgenv().LockProperty = function(Item, Property, Val)
+		if LockedVals[Item] == nil or typeof(LockedVals[Item]) ~= "table" then
+			LockedVals[Item] = {}
+		end
+		if Val == nil then
+			LockedVals[Item][Property] = true
+		else
+			LockedVals[Item][Property] = nil
+		end
+	end
+	SpoofedVals = {}
+	getgenv().SpoofProperty = function(Item, Property, Val, Bool)
+		if SpoofedVals[Item] == nil then
+			SpoofedVals[Item] = {}
+		end
+		if Bool == nil then
+			SpoofedVals[Item][Property] = Val
+		else
+			SpoofedVals[Item][Property] = nil
+		end
+	end
+	getgenv().AddNamecall = function(Call, f)
+		SpecialNameCalls[Call] = f
+	end
+	getgenv().NewOnIndexed = function(Item, Property, F)
+		local Tab;
+		if F then
+			if OnIndexed[Item] == nil then
+				OnIndexed[Item] = {}
+			end
+			if OnIndexed[Item][Property] == nil then
+				OnIndexed[Item][Property] = {}
+			end
+			Tab = OnIndexed[Item][Property]
+		else
+			if OnGlobalIndexed[Item] == nil then
+				OnGlobalIndexed[Item] = {}
+			end
+			Tab = OnGlobalIndexed[Item]
+			F = Property
+		end
+		local T;
+		local function Delete()
+			for i = 1, #Tab do
+				if Tab[#Tab-i+1] == T then
+					table.remove(Tab, #Tab-i+1)
+				end
+			end
+		end
+		T = setmetatable({["Delete"] = Delete, ["Remove"] = Delete, ["delete"] = Delete, ["remove"] = Delete, ["disconnect"] = Delete, ["Disconnect"] = Delete}, {__call = F})
+		table.insert(Tab, T)
+		return T
+	end
+	getgenv().NewOnNewIndexed = function(Item, Property, F)
+		local Tab;
+		if F then
+			if OnNewIndexed[Item] == nil then
+				OnNewIndexed[Item] = {}
+			end
+			if OnNewIndexed[Item][Property] == nil then
+				OnNewIndexed[Item][Property] = {}
+			end
+			Tab = OnNewIndexed[Item][Property]
+		else
+			if OnGlobalNewIndexed[Item] == nil then
+				OnGlobalNewIndexed[Item] = {}
+			end
+			Tab = OnGlobalNewIndexed[Item]
+			F = Property
+		end
+		local T;
+		local function Delete()
+			for i = 1, #Tab do
+				if Tab[i] == T then
+					table.remove(Tab, i)
+				end
+			end
+		end
+		T = setmetatable({["Delete"] = Delete, ["Remove"] = Delete, ["delete"] = Delete, ["remove"] = Delete, ["disconnect"] = Delete, ["Disconnect"] = Delete}, {__call = F})
+		table.insert(Tab, T)
+		return T
+	end
+	local Connections = {}
+	
+	local StoredCaptures = {}
+	function MakeCaptureRemoteCreation(Input)
+		return function(Remote)
+			if not StoredCaptures[Remote] then
+				NewOnIndexed(Remote, Input, function(Con, Item, Property, Value)
+					local Connection = function(Tab, Func)
+						if not Connections[Remote] then
+							Connections[Remote] = {}
+						end
+						table.insert(Connections[Remote], Func)
+						return Value:connect(Func)
+					end
+					local tab;
+					tab = setmetatable({["connect"] = Connection, ["Connect"] = Connection}, {__index = function(tab, v, ...)
+						local i = Value[v]
+						local F;
+						if string.find(tostring(i), "Signal") or typeof(i) == "function" then
+							F = function(tab, ...)
+								return i(Value, ...)
+							end
+							tab[v] = F
+							return F
+						end
+						return i
+					end})
+					StoredCaptures[Remote] = tab
+				end)
+			end
+			return StoredCaptures[Remote]
+		end
+	end
+	getgenv().CaptureRemoteEventInputs = MakeCaptureRemoteCreation("OnClientEvent")
+	StoredCaptures["OnClientEvent"] = CaptureRemoteEventInputs
+	getgenv().CaptureBindableEventInputs = MakeCaptureRemoteCreation("Event")
+	StoredCaptures["Event"] = CaptureBindableEventInputs
+	function MakeCaptureRemoteInputs(Input)
+		return function(Remote)
+			StoredCaptures[Remote] = true
+			NewOnNewIndexed(Remote, Input, function(Con, Item, Property, Value)
+				if not Connections[Remote] then
+					Connections[Remote] = {}
+				end
+				table.insert(Connections[Remote], Value)
+			end)
+		end
+	end
+	getgenv().CaptureRemoteFunctionInputs = MakeCaptureRemoteInputs("OnClientInvoke")
+	StoredCaptures["OnClientInvoke"] = CaptureRemoteFunctionInputs
+	getgenv().CaptureBindableFunctionInputs = MakeCaptureRemoteInputs("OnInvoke")
+	StoredCaptures["OnInvoke"] = CaptureBindableFunctionInputs
+	getgenv().ReturnFunctionsFromRemote = function(Remote)
+		return Connections[Remote]
+	end
+	getgenv().ReturnRemoteFunctions = function()
+		return Connections
+	end
+	getgenv().ReturnRemoteFunctionsWithStrings = function()
+		local T = {}
+		local StoredNames = {}
+		for i, v in pairs(Connections) do
+			local N = tostring(i)
+			if StoredNames[N] then
+				StoredNames[N] = StoredNames[N] + 1
+				N = N..tostring(StoredNames[N])
+			else
+				StoredNames[N] = 1
+			end
+			
+			T[N] = {Location = i:GetFullName(), v}
+		end
+		return T
+	end
+	getgenv().GetRemoteFunctions = function()
+		CollectingAllRemotes = not CollectingAllRemotes
+		return CollectingAllRemotes
+	end
+	setreadonly(meta, false)
+	getgenv().nc = meta.__namecall
+	meta.__namecall = newcclosure(function(rc, ...)
+		local args = {...}
+		if #args > 0 and typeof(args[#args]) == "string" and args[#args] == "BCheck" then
+			table.remove(args, #args)
+			return nc(rc, unpack(args))
+		elseif StoredItemTable[rc] ~= nil and StoredItemTable[rc][getnamecallmethod()] ~= nil then
+			return (StoredItemTable[rc][getnamecallmethod()])(unpack(args))
+		elseif (StoredItemTable[rc] ~= nil or LockedVals[rc] ~= nil or SpoofedVals[rc] ~= nil) and string.lower(getnamecallmethod()) == "clone" then
+			local TempOb = nc(rc, unpack(args))
+			if StoredItemTable[rc] ~= nil then
+				StoredItemTable[TempOb] = {}
+				for i, v in pairs(StoredItemTable[rc]) do
+					StoredItemTable[TempOb][i] = v
+				end
+			end
+			if LockedVals[rc] ~= nil then
+				LockedVals[TempOb] = LockedVals[rc]
+				if typeof(LockedVals[rc]) == "table" then
+					LockedVals[TempOb] = {}
+					for i, v in pairs(LockedVals[rc]) do
+						LockedVals[TempOb][i] = v
+					end
+				end
+			end
+			if SpoofedVals[rc] ~= nil then
+				SpoofedVals[TempOb] = {}
+				for i, v in pairs(SpoofedVals[rc]) do
+					SpoofedVals[TempOb][i] = v
+				end
+			end
+			return TempOb
+		elseif syn_context_get() < 6 and LockedVals[rc] == true then
+			error("Instance is locked, context of 6 or higher required, current context is: "..tostring(syn_context_get()))
+		elseif SpecialNameCalls[getnamecallmethod()] ~= nil then
+			return SpecialNameCalls[getnamecallmethod()](rc, unpack(args))
+		end
+		return nc(rc, unpack(args))    
+	end)
+	getgenv().id = meta.__index
+	meta.__index = newcclosure(function(rc, ...)
+		local args = {...}
+		if typeof(rc) ~= "Instance" or #args == 0 or args[1] and typeof(args[1]) == "userdata" and getrawmetatable(args[1]) then
+			return id(rc, ...)
+		end
+		if CollectingAllRemotes and syn_context_get() < 6 and (args[1] == "Event" or args[1] == "OnClientEvent") and not StoredCaptures[rc] then
+			StoredCaptures[args[1]](rc)
+		end
+		if StoredItemTable[rc] ~= nil and StoredItemTable[rc][args[1]] ~= nil then
+			return StoredItemTable[rc][args[1]]
+		elseif SpoofedVals[rc] ~= nil and SpoofedVals[rc][args[1]] ~= nil and syn_context_get() < 6 then
+			return SpoofedVals[rc][args[1]]
+		elseif syn_context_get() < 6 and LockedVals[rc] == true then
+			error("Instance is locked, context of 6 or higher required, current context is: "..tostring(syn_context_get()))
+		end
+		local Orig = id(rc, unpack(args))
+		if OnIndexed[rc] and OnIndexed[rc][args[1]] then
+			for i = 1, #OnIndexed[rc][args[1]] do
+				local v = OnIndexed[rc][args[1]][i](rc, args[1], Orig)
+				if v then
+					return v
+				end
+			end
+		end
+		if OnGlobalIndexed[rc] then
+			for i = 1, #OnGlobalIndexed[rc] do
+				local v = OnGlobalIndexed[rc][i](rc, args[1], Orig)
+				if v then
+					return v
+				end
+			end
+		end
+		return Orig
+	end)
+
+	function Check(Ob, Val, S)
+		local V = pcall(function()
+			return ne(Ob, Val, S)
+		end)
+		return V
+	end
+	
+	getgenv().ne = meta.__newindex
+	meta.__newindex = newcclosure(function(rc, Prop, Val)
+		if typeof(rc) == "table" then
+			return ne(rc, Prop, Val)
+		elseif typeof(Prop) == "userdata" and getrawmetatable(Prop) or typeof(Val) == "userdata" and getrawmetatable(Val) then
+			return ne(rc, Prop, Val)
+		elseif CollectingAllRemotes and syn_context_get() < 6 and (Prop == "OnInvoke" or Prop == "OnClientInvoke") and not StoredCaptures[rc] then
+			StoredCaptures[Prop](rc)
+		end
+		if OnNewIndexed[rc] and OnNewIndexed[rc][Prop] then
+			for i = 1, #OnNewIndexed[rc][Prop] do
+				local Ret = OnNewIndexed[rc][Prop][i](rc, Prop, Val)
+				if Ret then
+					Val = Ret
+				end
+			end
+		end
+		if syn_context_get() >= 6 and Prop ~= nil and Check(rc, Prop, Val) == false and Prop ~= "RLocked" then
+			if StoredItemTable[rc] == nil then
+				StoredItemTable[rc] = {}
+			end
+			StoredItemTable[rc][Prop] = Val
+			return Prop
+		elseif syn_context_get() >= 6 and Prop == "RLocked" then
+			if Val == true then
+				LockedVals[rc] = true
+			else
+				LockedVals[rc] = nil
+			end
+			return Val
+		elseif syn_context_get() < 6 and Prop ~= nil and (LockedVals[rc] ~= nil and (typeof(LockedVals[rc]) ~= "table" or LockedVals[rc][Prop])) then
+			return
+		end
+		return ne(rc, Prop, Val)
+	end)
+	getgenv().LolSpoof = function(Item, Prop, ToSpoof, NewValue)
+		NewOnNewIndexed(Item, Prop, function(T, I, P, NV)
+			return NewValue
+		end)
+		NewOnIndexed(Item, Prop, function(T, I, P, V)
+			return ToSpoof
+		end)
+	end
+	game.MetaRun = true
+end
+
+getgenv().GetStacks = function()
+    local Tab = {}
+    pcall(function()
+		local i = 0
+        while true do
+            table.insert(Tab, getfenv(i))
+			i = i + 1
+        end
+    end)
+    return Tab
+end
+
+local CF = {}
+getgenv().CreatedFunctions = CF
+local Fenvs = {}
+local FuncsCalls = {}
+local ts = tostring
+local TableNames = setmetatable({}, {__call = function(tab, Env, Tab)
+	if not tab[Env] then
+		tab[Env] = {}
+	end
+	if not tab[Env][Tab] then
+		tab[Env][Tab] = "Tab"..ts(#tab[Env])
+		table.insert(tab[Env], true)
+	end
+	return tab[Env][Tab]
+end})
+local stmt = setrawmetatable
+local grmt = getrawmetatable
+local tbin = table.insert
+local tbrm = table.remove
+local fnv = getfenv
+local pcl, unp, pr = pcall, unpack, print;
+local NotAllowedFunctions = {getrawmetatable = true, setrawmetatable = true, tbin = true, getfenv = true}
+local FF = function() tostring("") end
+local FakeFunctions = {["error"] = function() end, ["pcall"] = function(...)
+	tbin(CF, {...})
+	return pcl(...)
+end}
+local StoredPrint = getrenv().print
+local StoredRbx = {}
+local tpf = typeof
+local IndexedInstances = {}
+
+function ConvertTableToString(TB, ...)
+	local Tab = {...}
+	local S = ""
+	for i = 1, #Tab do
+		local s = false
+		if tpf(Tab[i]) == "string" then
+			S = S..'"'
+			s = true
+		end
+		if tpf(Tab[i]) ~= "table" then
+			S = S..ts(Tab[i])
+		elseif not IndexedInstances[Tab[i]] then
+			S = S..TableNames(TB, Tab[i])
+		else
+			S = S.."game."..IndexedInstances[Tab[i]]:GetFullName()
+		end
+		if s then
+			S = S..'"'
+		end
+		if i ~= #Tab then
+			S = S..", "
+		end
+	end
+	return S
+end
+
+for i, v in pairs(getrenv()) do
+    if i ~= "__index" and not FakeFunctions[i] then
+        StoredRbx[i] = v
+    elseif FakeFunctions[i] then
+        StoredRbx[i] = FakeFunctions[i]
+    end
+end
+local StoredFuncs = {}
+local LogArgs = true
+local TempTab = setmetatable({}, {__index = newcclosure(function(Tab, Val)
+    tbin(FuncsCalls[fnv(2)], Val)
+    return StoredRbx[Val]
+end)})
+local FakeTables = {}
+function SetupTable(Indx, Tab, FuncsTab)
+	if not FakeTables[Indx] then
+		FakeTables[Indx] = {}
+		stmt(FakeTables[Indx], {__index = newcclosure(function(T, Val)
+			tbin(FuncsTab, Val)
+			if not StoredFuncs[Tab[Val]] then
+				StoredFuncs[Tab[Val]] = function(...)
+					local N = #FuncsTab
+					if FuncsTab[N] == Val then
+						tbrm(FuncsTab, N)
+					end
+					if FuncsTab[N-1] == Indx then
+						tbrm(FuncsTab, N-1)
+					end
+					local S = Indx.."."..Val
+					tbin(FuncsTab, S.."("..ConvertTableToString(FuncsTab, ...)..")")
+					return Tab[Val](...)
+				end
+			end
+			if LogArgs then
+				return StoredFuncs[Tab[Val]]
+			end
+			return Tab[Val]
+		end)})
+	end
+end
+
+FakeFunctions["getrenv"] = function() return TempTab end
+FakeFunctions["getfenv"] = function() return TempTab end
+FakeFunctions["getgenv"] = function() return TempTab end
+
+
+local sf = string.find
+local InstanceMeta;
+InstanceMeta = {__index = function(Tab, Val)
+	local I = Tab.I
+	local S = "game."..I.GetFullName(I)
+	local NS = S.."."..tostring(Val)
+	local F = FuncsCalls[fnv(2)]
+	if not sf(S, "Game") then
+		if F[#F] == S then
+			F[#F] = NS
+		else
+			table.insert(F, NS)
+		end
+	end
+	if tpf(I[Val]) == "Instance" then
+		local MT = setmetatable({["I"] = I[Val]}, InstanceMeta)
+		IndexedInstances[MT] = I[Val]
+		return MT
+	else
+		return I[Val]
+	end
+end,
+__newindex = function(Tab, Indx, Val)
+	local I = Tab.I
+	local S = "game."..I.GetFullName(I)
+	local NS = S.."."..tostring(Indx).." = "..tostring(Val)
+	local F = FuncsCalls[fnv(2)]
+	if not sf(S, "Game") then
+		if F[#F] == S then
+			F[#F] = NS
+		else
+			table.insert(F, NS)
+		end
+	end
+	I[Indx] = Val
+end,
+__call = function(Tab, Indx, ...)
+	local I = Tab.I
+	local S = "game."..I.GetFullName(I)
+	local NS = S..":"..tostring(Indx).."("..tostring(...)..")"
+	local F = FuncsCalls[fnv(2)]
+	if not sf(S, "Game") then
+		if F[#F] == S then
+			F[#F] = NS
+		else
+			table.insert(F, NS)
+		end
+	end
+	I[Indx](I, ...)
+end,
+__tostring = function(Tab)
+	return tostring(Tab.I)
+end}
+
+FakeFunctions["game"] = setmetatable({["I"] = game}, InstanceMeta)
+IndexedInstances[FakeFunctions["game"]] = game
+
+getgenv().StackCheck = function(F, ...)
+	LogArgs = false
+    if NotAllowedFunctions[F] then
+        return {}
+    end
+    local Fenv = getfenv(F)
+    FuncsCalls[Fenv] = {}
+	local MyFenv = getrawmetatable(Fenv)
+    local mt;
+    local indx = function(Tab, Val)
+        tbin(FuncsCalls[Fenv], Val)
+        if Tab == Fenv and not FakeFunctions[Val] and tpf(MyFenv.__index[Val]) ~= "table" then
+            return MyFenv.__index[Val]
+        elseif FakeFunctions[Val] and Val ~= "game" then
+            return FakeFunctions[Val]
+		elseif typeof(MyFenv.__index[Val]) == "table" then
+			SetupTable(Val, MyFenv.__index[Val], MyFenv)
+			return FakeTables[Val]
+		elseif typeof(MyFenv.__index[Val]) == "Instance" then
+			
+        else
+            return rawget(Tab, Val)
+        end
+    end
+    stmt(Fenv, {__index = indx})
+	local Args = {...}
+	local B, Ret = pcl(function() return {F(unp(Args))} end)
+    stmt(Fenv, MyFenv)
+	if B == false then
+		print("Error: "..ts(Ret))
+	end
+    return FuncsCalls[Fenv], B
+end
+
+local ls = loadstring
+getgenv().StackCheckWithArgs = function(F, ...)
+	LogArgs = true
+    if NotAllowedFunctions[F] then
+        return {}
+    end
+    local Fenv = getfenv(F)
+    FuncsCalls[Fenv] = {}
+	local MyFenv = getrawmetatable(Fenv)
+    local mt;
+    local indx = function(Tab, Val)
+		if Val == "loadstring" then
+			return ls
+		end
+        --tbin(FuncsCalls[Fenv], Val)
+        if Tab == Fenv and not FakeFunctions[Val] and tpf(MyFenv.__index[Val]) ~= "table" then
+			if tpf(MyFenv.__index[Val]) == "function" then
+				
+				if not StoredFuncs[MyFenv] then
+					StoredFuncs[MyFenv] = {}
+				end
+				if not StoredFuncs[MyFenv][MyFenv.__index[Val]] then
+					StoredFuncs[MyFenv][MyFenv.__index[Val]] = function(...)
+						local N = Val
+						
+						if FuncsCalls[Fenv][#FuncsCalls[Fenv]] == N then
+							tbrm(FuncsCalls[Fenv], #FuncsCalls[Fenv])
+						end
+						tbin(FuncsCalls[Fenv], N.."("..ConvertTableToString(FuncsCalls[Fenv], ...)..")")
+						return MyFenv.__index[Val](...)
+					end
+				end
+				return StoredFuncs[MyFenv][MyFenv.__index[Val]]
+			end
+            return MyFenv.__index[Val]
+        elseif FakeFunctions[Val] then
+            return FakeFunctions[Val]
+		elseif tpf(MyFenv.__index[Val]) == "table" then
+			SetupTable(Val, MyFenv.__index[Val], FuncsCalls[Fenv])
+			return FakeTables[Val]
+		elseif tpf(MyFenv.__index[Val]) == "Instance" then
+			if not FakeTables[MyFenv.__index[Val]] then
+				FakeTables[MyFenv.__index[Val]] = setmetatable({["I"] = MyFenv.__index[Val]}, InstanceMeta)
+			end
+			return FakeTables[MyFenv.__index[Val]]
+        else
+			pr("raw?", Val)
+            return rawget(Tab, Val)
+        end
+    end
+    stmt(Fenv, {__index = indx})
+	local Args = {...}
+	local B, Ret = pcl(function() return {F(unp(Args))} end)
+    stmt(Fenv, MyFenv)
+	if B == false then
+		print("Error: "..ts(Ret))
+	end
+	LogArgs = false
+    return FuncsCalls[Fenv], B
+end
+
+getgenv().PrintStack = function(...)
+    print("--------U--------")
+    local Funcs = StackCheck(...)
+    print("--------D--------")
+    for i = 1, #Funcs do
+        print(Funcs[i])
+    end
+end
+
+getgenv().PrintStackWithArgs = function(...)
+	print("--------U--------")
+    local Funcs = StackCheckWithArgs(...)
+    print("--------D--------")
+    for i = 1, #Funcs do
+        print(Funcs[i])
+    end
+end
+
+getgenv().LogStackWithArgs = function(ScrName, ...)
+	writefile(ScrName, "")
+	local Funcs = StackCheckWithArgs(...)
+	for i = 1, #Funcs do
+		appendfile(ScrName, Funcs[i].."\n")
+	end
+end
+
+getgenv().StoreTools = function(...)
+    args = {...}
+    for i, v in pairs(game.Players.LocalPlayer.Backpack:GetChildren()) do
+        local Open = true
+        for a = 1, #args do
+            if v.Name == args[a] then
+                Open = false
+                break
+            end
+        end
+        if Open == true then
+            v.Parent = game.Players.LocalPlayer
+        end
+    end
+end
+
+getgenv().UnStore = function()
+    for i, v in pairs(game.Players.LocalPlayer:GetChildren()) do
+        if v:IsA("Tool") then
+            v.Parent = game.Players.LocalPlayer.Backpack
+        end
+    end
+end
+
+getgenv().TimeFunction = function(F, ...)
+    local Start = tick()
+    F(...)
+    return tick()-Start
+end
+
+function AvoidCrasher(Fenv, F)
+    for i, v in pairs(Fenv) do
+        if i == "script" and typeof(v) == "Instance" and v.ClassName == F.ClassName and F == v then
+            return true
+        end
+    end
+    return false
+end
+function LoopThroughTable(Tab, F, LookThrough)
+    for i, v in pairs(LookThrough) do
+        if typeof(v) == "function" and islclosure(v) and getfenv(v) and AvoidCrasher(getfenv(v), F) then
+            table.insert(Tab, v)
+        end
+    end
+end
+getgenv().GetFunctionsFromScript = function(F)
+    local functionstab = {}
+    LoopThroughTable(functionstab, F, getgc())
+    LoopThroughTable(functionstab, F, debug.getregistry())
+    return functionstab
+end
+local IgnoredTypes = {["boolean"] = true, ["number"] = true, ["function"] = true, ["Instance"] = true}
+function FilterConstants(Consts)
+    local RealConstants = {}
+    for i = 1, #Consts do
+        local Original = Consts[i]
+        Consts[i] = tostring(Consts[i])
+        if IgnoredTypes[typeof(Original)] == nil and not ((string.sub(Consts[i], 1, 1) == "p" or string.sub(Consts[i], 1, 1) == "u" or string.sub(Consts[i], 1, 1) == "v") and tonumber(string.sub(Consts[i], 2)) ~= nil) then
+            if string.sub(Consts[i], 1, 3) ~= "l__" and string.len(Consts[i]) > 0 and (string.sub(Consts[i], 1, 4) ~= "Enum" or string.len(Consts[i]) > 4) then
+				table.insert(RealConstants, Consts[i])
+            end
+        end
+    end
+    return RealConstants
+end
+
+function Replace(Str, What, Rep)
+    local StrTab = string.split(Str, What)
+    local NewS = StrTab[1]
+    if #StrTab > 1 then
+        for i = 2, #StrTab do
+            NewS = NewS..Rep..StrTab[i]
+        end
+    end
+    return NewS
+end
+
+setreadonly(string, false)
+string.replace = Replace
+setreadonly(string, true)
+
+function RemoveFors(Str)
+    S = ""
+    Spl = string.split(Str, "\n")
+    Open = 0
+    DidRemove = false
+    for i = 1, #Spl do
+        local DidUse = false
+        if i+1 <= #Spl and string.find(Spl[i+1], "while true do") and (string.find(Spl[i], " = 0") or string.find(Spl[i], " = 1")) and Open < i then
+            local NumberOfEnters = string.split(Spl[i+1], "while")[1]
+            local VV = string.sub(Spl[i], string.len(NumberOfEnters)+1)
+            local VarName = string.split(VV, " ");
+            if string.find(VV, "local") then
+                VarName = VarName[2]
+            else
+                VarName = VarName[1]
+            end
+            local Number = string.split(string.split(VV, " = ")[2], ";")[1]
+            if string.find(Number, "-") or string.find(Number, "+") then
+                Number = tonumber(string.split(string.sub(Number, 2), " ")[2]..string.split(string.sub(Number, 2), " ")[3])
+                if string.find(Spl[i], " = 1") then
+                    Number = Number + 1
+                end
+                Number = tostring(Number)
+            end
+            local StartLine;
+            for a = i, #Spl do
+                if string.find(Spl[a], "if 0 <= 1 then") and string.sub(Spl[a], string.len(NumberOfEnters) +2) == "if 0 <= 1 then" then
+                    S = S..NumberOfEnters.."for "..VarName.." = "..Number..", "..string.split(Spl[a+1], " ")[4].." do\n"
+                    Open = a+12
+                    for b = i+2, a-1 do
+                        S = S..Spl[b].."\n"
+                    end
+                    S = S..NumberOfEnters.."end;\n"
+                    DidRemove = true
+                    DidUse = true
+                    break
+                end
+            end
+        elseif Open < i then
+            S = S..Spl[i].."\n"
+        end
+        if not DidUse and i+1 <= #Spl and string.find(Spl[i+1], "while true do") and (string.find(Spl[i], " = 0") or string.find(Spl[i], " = 1")) and Open < i then
+            S = S..Spl[i].."\n"
+        end
+    end
+    return S, DidRemove
+end
+
+function FixForLoops(Str)
+    local Spl = string.split(Str, "\n")
+    local S = ""
+    Open = 0
+    for i = 1, #Spl do
+        if string.find(Spl[i], "= pairs") and string.find(Spl[i], ");") and Open <i then
+            local av = string.find(Spl[i], "= pairs")
+            local l = string.len(Spl[i])
+            local NumberOfEnters;
+            if string.find(Spl[i], "local") then
+                NumberOfEnters = string.split(Spl[i], "local")[1]
+            else
+                NumberOfEnters = string.find(Spl[i], "v")-1
+                NumberOfEnters = string.sub(Spl[i], 1, NumberOfEnters)
+            end
+            local Strt = i+2
+            for a = i, #Spl do
+                if string.find(Spl[a], ", ") and string.find(Spl[a], " = v") then
+                    Strt = a
+                    break
+                end
+            end
+            local vars1 = string.split(Spl[Strt], " = ")[1]
+            local vars2 = string.split(vars1, "local")
+            if #vars2 > 1 then
+                vars2 = vars2[2]
+            else
+                local ab = string.find(vars1, "v")
+                vars2 = string.sub(vars1, ab-1)
+            end
+            --print(vars1)
+            local vars = string.split(vars2, ", ")
+            local WhileLoop = ""
+            local LL = 0
+            for a = i+9, #Spl do
+                WhileLoop = WhileLoop..Spl[a].."\n"
+                if string.find(Spl[a], "end;") and string.sub(Spl[a], 1, string.len(NumberOfEnters)) == NumberOfEnters then
+                    Open = a
+                    break
+                end    
+            end
+            WhileLoop = NumberOfEnters.."for"..vars[1]..", "..vars[2].. " in "..string.sub(Spl[i], av+2, l-1).." do\n"..WhileLoop
+            S = S..WhileLoop
+        elseif Open < i then
+            S = S..Spl[i].."\n"
+        end
+    end
+    Str = S
+    while true do
+        Str, Removed = RemoveFors(Str)
+        if not Removed then
+            break
+        end
+    end
+    return Str
+end
+local BlockedStrings = {" ", ";", ")", "FireServer"}
+function GetProperNames(Str, NotFunc)
+    if Str == nil or string.len(Str) < 10 then
+        return Str 
+    end
+    local StartSplit = string.split(Str, "-- Decompiled with the Synapse X Luau decompiler.")
+    if #StartSplit == 2 and NotFunc == nil then
+        Str = "-- Decompiled with the Synapse X Luau decompiler.\nlocal Upvalues = getupvalues(Function)"..StartSplit[2]
+    end
+        
+    local Splits = string.split(Str, "__")
+    local CurrentName;
+    local Names = {}
+    for i = 1, #Splits do
+        local Found = false
+        for a = 1, #BlockedStrings do
+            if string.find(Splits[i], BlockedStrings[a]) then
+                Found = true
+                break
+            end
+        end
+        if not Found then
+            CurrentName = Splits[i]
+            local Number;
+            for a = 1, string.len(Splits[i+1]) do
+                if not tonumber(string.sub(Splits[i+1], a, a)) then
+                    Number = string.sub(Splits[i+1], 1, a-1)
+                    Str = string.replace(Str, "l__"..CurrentName.."__"..Number, CurrentName)
+                    break
+                end
+            end
+            if not table.find(Names, CurrentName) then
+                table.insert(Names, CurrentName)
+            end
+        end
+    end
+    for i = #Names, 1, -1 do
+        if string.find(Names[i], "UPVAL") then
+            local Number = tonumber(string.split(Names[i], "_")[2])
+            Str = string.replace(Str, "local "..Names[i], "Upvalues["..tostring(Number+1).."]")
+            Str = string.replace(Str, Names[i], "Upvalues["..tostring(Number+1).."]")
+        end
+    end
+    return string.replace(Str, " = local ", " = ")
+end
+getgenv().decomp = function(Scr)
+	return FixForLoops(GetProperNames(Scr, true))
+end
+
+local ToHoldRemotes = {}
+local RemoteStuffLogged = {}
+setmetatable(RemoteStuffLogged, {
+    __newindex = function(Tab, Ind, Val)
+        if not Val then
+            rawset(Tab, ToHoldRemotes[Ind], Val)
+            for i, v in pairs(ToHoldRemotes) do
+                if v == Ind then
+                    ToHoldRemotes[i] = nil
+                    return
+                end
+            end
+            return
+        end
+        local NameNumber = 0
+        for i, v in pairs(RemoteStuffLogged) do
+            if i == tostring(Ind) then
+                NameNumber = NameNumber + 1
+            end
+        end
+        rawset(Tab, tostring(Ind)..tostring(NameNumber), Val)
+        ToHoldRemotes[Ind] = tostring(Ind)..tostring(NameNumber)
+    end,
+    __index = function(Tab, Ind)
+        if ToHoldRemotes[Ind] then
+            return Tab[ToHoldRemotes[Ind]]
+        end
+    end
+})
+getgenv().LoggedStuff = RemoteStuffLogged
+
+function getMaxInfo()
+    local i = 0
+    pcall(function()
+        while true do
+            local Soruce = getinfo(i).source
+            i = i + 1
+        end
+    end)
+    return i-4
+end
+
+function GetInfos(Str)
+    local Infos = {["Debug Info"] = Str}
+    for i = 1, getMaxInfo() do
+        local inf = getinfo(i)
+        if not (string.sub(inf.source, 1, 1) == "@") and not (inf.source == "=[C]") then
+            table.insert(Infos, inf)
+        end
+    end
+    return Infos
+end
+
+function LogRemoteStuff(Remote, Str)
+    if not RemoteStuffLogged[Remote] then
+        RemoteStuffLogged[Remote] = {}
+    end
+    table.insert(RemoteStuffLogged[Remote], GetInfos(Str))
+end
+
+local Funcs = {}
+function Dive(Tab, Str)
+    if not Str then
+       Str = "" 
+    end
+    for i, v in pairs(Tab) do
+        local Start = ""
+        local End = "";
+        if Str ~= "" then
+            Start = "."
+        end
+        if typeof(v) == "function" then
+            Funcs[v] = Str..Start..tostring(i)
+        elseif typeof(v) == "table" then
+            Dive(v, Str..Start..tostring(i))
+        end
+    end
+end
+Dive(getgenv())
+Dive(getrenv())
+
+getgenv().pn = function(F)
+    if Funcs[F] then
+        print(Funcs[F])
+        return
+    end
+    print(debug.getinfo(F).name)
+end
+
+spawn(function()
+	getgenv().Ta = {}
+	local Max = 30
+	while wait() do
+		if #Ta > Max then
+			for i = Max, 1, -1 do
+				Ta[i] = string.replace(tostring(Ta[i]), "\0", "")
+				if Ta[i] ~= "" then
+					print(Ta[i])
+				end
+				table.remove(Ta, i)
+			end
+		elseif Ta[1] then
+			print(Ta[1])
+			table.remove(Ta, 1)
+		end
+	end
+end)
