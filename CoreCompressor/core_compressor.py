@@ -449,6 +449,44 @@ def sort_entries(entries, mode, log=print):
     return sorted(out, key=lambda e: e[1].lower())
 
 
+def find_duplicates(entries, log=print, progress=_noop, cancel=None):
+    """Drop files whose content is identical to an earlier file. Only files that share
+    their size with another file are fingerprinted, so unique files cost nothing extra.
+    Returns (kept entries, {skipped name: name of the identical file that was kept})."""
+    by_size = {}
+    for src, arcname in entries:
+        if _is_regular(src):
+            size = os.path.getsize(src)
+            if size:
+                by_size.setdefault(size, []).append(src)
+    candidates = {src for group in by_size.values() if len(group) > 1 for src in group}
+    if not candidates:
+        return entries, {}
+    total = sum(os.path.getsize(src) for src in candidates) or 1
+    done = 0
+
+    def on_read(n):
+        nonlocal done
+        done += n
+        progress(done / total, f"Checking for duplicates... {human(done)} of {human(total)}")
+
+    kept, duplicates, first = [], {}, {}
+    for src, arcname in entries:
+        if src in candidates:
+            key = (os.path.getsize(src), sha256_file(src, cancel, on_read))
+            if key in first:
+                duplicates[arcname] = first[key]
+                continue
+            first[key] = arcname
+        kept.append((src, arcname))
+    if duplicates:
+        saved = sum(os.path.getsize(src) for src, a in entries if a in duplicates)
+        log(f"Skipping {len(duplicates)} duplicate file(s), {human(saved)}:")
+        for dup, original in duplicates.items():
+            log(f"  {dup}  (same as {original})")
+    return kept, duplicates
+
+
 def _add_entries(tar, entries, manifest, log, on_read, cancel):
     for src, arcname in entries:
         if cancel is not None and cancel.is_set():
@@ -473,7 +511,7 @@ def _add_entries(tar, entries, manifest, log, on_read, cancel):
 
 
 def compress(output, inputs, level="best", log=print, progress=_noop, cancel=None,
-             threads=CPU_COUNT, sort="none"):
+             threads=CPU_COUNT, sort="none", skip_duplicates=False):
     """Create an archive. progress(fraction, text) is called as work proceeds.
     threads = how many CPU cores compress at the same time."""
     if not output.endswith(EXTENSION):
@@ -482,10 +520,22 @@ def compress(output, inputs, level="best", log=print, progress=_noop, cancel=Non
     part = output + ".part"
     skip = {out_abs, os.path.abspath(part)}
     entries = [e for e in collect(inputs) if os.path.abspath(e[0]) not in skip]
-    entries = sort_entries(entries, sort, log)
+    duplicates, duplicate_bytes = {}, 0
+    if skip_duplicates:  # before sorting, so the kept copy gets the plain name
+        sizes = {a: os.path.getsize(src) for src, a in entries if _is_regular(src)}
+        source = dict((a, src) for src, a in entries)
+        entries, duplicates = find_duplicates(entries, log, lambda f, t: progress(None, t), cancel)
+        duplicate_bytes = sum(sizes[d] for d in duplicates)
+    new_entries = sort_entries(entries, sort, log)
+    if duplicates and sort != "none":
+        new_name = {src: a for src, a in new_entries}
+        duplicates = {d: new_name[source[kept]] for d, kept in duplicates.items()}
+    entries = new_entries
     total = sum(os.path.getsize(src) for src, _ in entries if _is_regular(src)) or 1
 
     manifest = {"format": 1, "created": time.time(), "files": {}}
+    if duplicates:
+        manifest["duplicates"] = duplicates  # skipped copy -> identical file kept
     start = time.time()
     done = 0
 
@@ -525,15 +575,19 @@ def compress(output, inputs, level="best", log=print, progress=_noop, cancel=Non
     stats = {
         "output": output,
         "files": len(manifest["files"]),
-        "original": original_size,
+        "original": original_size + duplicate_bytes,  # what it would take without skipping
         "packed": packed,
-        "saved": (1 - packed / original_size) * 100 if original_size else 0.0,
+        "saved": (1 - packed / (original_size + duplicate_bytes)) * 100
+        if original_size + duplicate_bytes else 0.0,
         "seconds": time.time() - start,
+        "duplicates": len(duplicates),
+        "duplicate_bytes": duplicate_bytes,
     }
     progress(1.0, "Done")
     log(
         f"Done in {stats['seconds']:.1f}s: {stats['files']} files, "
-        f"{human(original_size)} -> {human(packed)} ({stats['saved']:.1f}% smaller). "
+        + (f"{stats['duplicates']} duplicate(s) skipped, " if duplicates else "")
+        + f"{human(stats['original'])} -> {human(packed)} ({stats['saved']:.1f}% smaller). "
         f"Verified lossless."
     )
     return stats
@@ -870,7 +924,7 @@ def download(url, folder, log=print, progress=_noop, cancel=None, connections=1)
 
 def download_and_compress(urls, output, level="best", keep_originals=False, log=print,
                           progress=_noop, cancel=None, threads=CPU_COUNT,
-                          parallel=1, connections=1, sort="none"):
+                          parallel=1, connections=1, sort="none", skip_duplicates=False):
     """Download every link (`parallel` at a time), then pack them all into one verified
     archive using `threads` CPU cores."""
     urls = [u.strip() for u in urls if u.strip()]
@@ -910,8 +964,8 @@ def download_and_compress(urls, output, level="best", keep_originals=False, log=
 
         log(f"Compressing {len(files)} downloaded file(s)...")
         stats = compress(output, files, level=level, log=log, cancel=cancel, threads=threads,
-                         sort=sort,
-                         progress=lambda f, t: progress(0.5 + 0.5 * f, t))
+                         sort=sort, skip_duplicates=skip_duplicates,
+                         progress=lambda f, t: progress(None if f is None else 0.5 + 0.5 * f, t))
         if keep_originals:
             for f in files:
                 shutil.move(f, _unique_path(folder, os.path.basename(f)))
@@ -940,6 +994,36 @@ def list_archive(archive, log=print):
 
 
 # ----------------------------------------------------------------------------- GUI
+
+def settings_file():
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "CoreCompressor", "settings.json")
+
+
+def load_settings():
+    try:
+        with open(settings_file(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(data):
+    path = settings_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass  # not being able to save settings should never stop the program
+
 
 def open_in_file_manager(path):
     import subprocess
@@ -1020,7 +1104,7 @@ def run_gui():
         )
 
     ui_queue = queue.Queue()
-    state = {"busy": None, "progress": None, "cancel": None}
+    state = {"busy": None, "progress": None, "cancel": None, "thread": None}
 
     def call_ui(fn):
         ui_queue.put(fn)
@@ -1189,36 +1273,22 @@ def run_gui():
         "Normal": "normal",
         "Fast: bigger file (quicker)": "fast",
     }
-    level_var = tk.StringVar(value=next(iter(level_names)))
-    core_names = {f"All {CPU_COUNT} (fastest)": CPU_COUNT}
-    core_names.setdefault(f"Half ({max(1, CPU_COUNT // 2)})", max(1, CPU_COUNT // 2))
-    core_names.setdefault("1 (uses least memory)", 1)
-    cores_var = tk.StringVar(value=next(iter(core_names)))  # shared by both tabs
-
-    def cores_picker(parent):
-        ttk.Label(parent, text="CPU cores:").pack(side="left", padx=(16, 6))
-        ttk.Combobox(parent, textvariable=cores_var, values=list(core_names),
-                     state="readonly", width=22).pack(side="left")
-
+    core_options = {  # saved key -> (label, number of cores)
+        "all": (f"All {CPU_COUNT} (fastest)", CPU_COUNT),
+        "half": (f"Half ({max(1, CPU_COUNT // 2)})", max(1, CPU_COUNT // 2)),
+        "one": ("1 (uses least memory)", 1),
+    }
+    core_names = {label: n for label, n in core_options.values()}
     sort_names = {label: key for key, label in SORT_MODES.items()}
-    sort_var = tk.StringVar(value=SORT_MODES["none"])  # shared by both tabs
 
-    def sort_row(parent):
-        row = ttk.Frame(parent)
-        ttk.Label(row, text="Sort files:", width=12).pack(side="left")
-        ttk.Combobox(row, textvariable=sort_var, values=list(sort_names),
-                     state="readonly", width=34).pack(side="left")
-        ttk.Label(row, text="Your original files are not moved.",
-                  style="Hint.TLabel").pack(side="left", padx=12)
-        return row
-
-    c_sort_row = sort_row(ctab)
-    level_row = ttk.Frame(ctab)
-    ttk.Label(level_row, text="Compression:", width=12).pack(side="left")
-    ttk.Combobox(
-        level_row, textvariable=level_var, values=list(level_names), state="readonly", width=30
-    ).pack(side="left")
-    cores_picker(level_row)
+    # All settings live on the Settings tab; these defaults can be replaced by saved ones.
+    level_var = tk.StringVar(value=next(iter(level_names)))
+    cores_var = tk.StringVar(value=core_options["all"][0])
+    sort_var = tk.StringVar(value=SORT_MODES["none"])
+    dedupe_var = tk.BooleanVar(value=False)
+    fast_dl_var = tk.BooleanVar(value=True)
+    keep_var = tk.BooleanVar(value=False)
+    remember_var = tk.BooleanVar(value=False)
 
     def browse_output():
         p = filedialog.asksaveasfilename(
@@ -1243,9 +1313,7 @@ def run_gui():
     c_result.pack(side="bottom", fill="x", pady=(6, 0))
     c_status.pack(side="bottom", fill="x", pady=(4, 0))
     c_action.pack(side="bottom", fill="x", pady=(12, 0))
-    out_row.pack(side="bottom", fill="x", pady=(8, 0))
-    c_sort_row.pack(side="bottom", fill="x", pady=(8, 0))
-    level_row.pack(side="bottom", fill="x", pady=(10, 0))
+    out_row.pack(side="bottom", fill="x", pady=(12, 0))
     buttons.pack(side="bottom", fill="x")
     tree_frame.pack(fill="both", expand=True, pady=(8, 6))
 
@@ -1351,20 +1419,6 @@ def run_gui():
     ttk.Button(link_buttons, text="Clear",
                command=lambda: links.delete("1.0", "end")).pack(side="left", padx=6)
 
-    d_level_var = tk.StringVar(value=next(iter(level_names)))
-    d_level_row = ttk.Frame(dtab)
-    ttk.Label(d_level_row, text="Compression:", width=12).pack(side="left")
-    ttk.Combobox(d_level_row, textvariable=d_level_var, values=list(level_names),
-                 state="readonly", width=30).pack(side="left")
-    keep_var = tk.BooleanVar(value=False)
-    cores_picker(d_level_row)
-    d_speed_row = ttk.Frame(dtab)
-    fast_dl_var = tk.BooleanVar(value=True)
-    ttk.Checkbutton(d_speed_row, text="Fast download (3 files at once, 4 connections per file)",
-                    variable=fast_dl_var).pack(side="left")
-    ttk.Checkbutton(d_speed_row, text="Also keep the uncompressed files",
-                    variable=keep_var).pack(side="left", padx=16)
-
     def browse_d_output():
         p = filedialog.asksaveasfilename(
             title="Save compressed downloads as",
@@ -1392,12 +1446,95 @@ def run_gui():
     d_result.pack(side="bottom", fill="x", pady=(6, 0))
     d_status.pack(side="bottom", fill="x", pady=(4, 0))
     d_action.pack(side="bottom", fill="x", pady=(12, 0))
-    d_out_row.pack(side="bottom", fill="x", pady=(8, 0))
-    sort_row(dtab).pack(side="bottom", fill="x", pady=(8, 0))
-    d_speed_row.pack(side="bottom", fill="x", pady=(8, 0))
-    d_level_row.pack(side="bottom", fill="x", pady=(10, 0))
+    d_out_row.pack(side="bottom", fill="x", pady=(12, 0))
     link_buttons.pack(side="bottom", fill="x", pady=(6, 0))
     links_frame.pack(fill="both", expand=True, pady=(8, 0))
+
+    # ---- Settings tab
+    stab = ttk.Frame(notebook, padding=14)
+    notebook.add(stab, text="Settings")
+
+    def section(title):
+        frame = ttk.LabelFrame(stab, text=f" {title} ", padding=(12, 8))
+        frame.pack(fill="x", pady=(0, 10))
+        frame.columnconfigure(2, weight=1)
+        return frame
+
+    def combo_setting(frame, row, label, var, values, width=34, hint=""):
+        ttk.Label(frame, text=label, width=16).grid(row=row, column=0, sticky="w", pady=3)
+        ttk.Combobox(frame, textvariable=var, values=values, state="readonly",
+                     width=width).grid(row=row, column=1, sticky="w", pady=3)
+        if hint:
+            ttk.Label(frame, text=hint, style="Hint.TLabel").grid(
+                row=row, column=2, sticky="w", padx=12)
+
+    def check_setting(frame, row, label, var, hint=""):
+        ttk.Checkbutton(frame, text=label, variable=var).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=3)
+        if hint:
+            ttk.Label(frame, text=hint, style="Hint.TLabel").grid(
+                row=row, column=2, sticky="w", padx=12)
+
+    box = section("Compression")
+    combo_setting(box, 0, "Compression level:", level_var, list(level_names))
+    combo_setting(box, 1, "CPU cores:", cores_var, list(core_names))
+    box = section("Organize")
+    combo_setting(box, 0, "Sort files:", sort_var, list(sort_names),
+                  hint="Your original files are not moved.")
+    check_setting(box, 1, "Skip duplicate files", dedupe_var,
+                  hint="Identical files are stored only once.")
+    box = section("Downloads")
+    check_setting(box, 0, "Fast download (3 files at once, 4 connections per file)", fast_dl_var)
+    check_setting(box, 1, "Also keep the uncompressed files", keep_var)
+    box = section("General")
+    check_setting(box, 0, "Remember settings", remember_var,
+                  hint="Your choices are kept for the next time you open the program.")
+
+    defaults = {
+        "level": "best", "cores": "all", "sort": "none", "skip_duplicates": False,
+        "fast_download": True, "keep_downloads": False,
+    }
+
+    def current_settings():
+        return {
+            "level": level_names[level_var.get()],
+            "cores": next(k for k, (label, _) in core_options.items() if label == cores_var.get()),
+            "sort": sort_names[sort_var.get()],
+            "skip_duplicates": dedupe_var.get(),
+            "fast_download": fast_dl_var.get(),
+            "keep_downloads": keep_var.get(),
+        }
+
+    def apply_settings(values):
+        level_label = {v: k for k, v in level_names.items()}
+        if values.get("level") in level_label:
+            level_var.set(level_label[values["level"]])
+        if values.get("cores") in core_options:
+            cores_var.set(core_options[values["cores"]][0])
+        if values.get("sort") in SORT_MODES:
+            sort_var.set(SORT_MODES[values["sort"]])
+        for key, var in (("skip_duplicates", dedupe_var), ("fast_download", fast_dl_var),
+                         ("keep_downloads", keep_var)):
+            if isinstance(values.get(key), bool):
+                var.set(values[key])
+
+    ttk.Button(stab, text="Reset to defaults",
+               command=lambda: apply_settings(defaults)).pack(anchor="w", pady=(4, 0))
+
+    saved = load_settings()
+    if saved.get("remember"):
+        remember_var.set(True)
+        apply_settings(saved)
+
+    def save_now(*_):
+        if remember_var.get():
+            save_settings({"remember": True, **current_settings()})
+        else:
+            save_settings({"remember": False})
+
+    for var in (level_var, cores_var, sort_var, dedupe_var, fast_dl_var, keep_var,
+                remember_var):
+        var.trace_add("write", save_now)
 
     # ---- Details tab
     ltab = ttk.Frame(notebook, padding=14)
@@ -1439,7 +1576,8 @@ def run_gui():
             finally:
                 call_ui(finish_job)
 
-        threading.Thread(target=worker, daemon=True).start()
+        state["thread"] = threading.Thread(target=worker, daemon=True)
+        state["thread"].start()
 
     def finish_job():
         kind = state["busy"]
@@ -1448,6 +1586,11 @@ def run_gui():
             w[0].configure(text=w[6], state="normal")
             if k == kind:
                 w[2].configure(text="")
+
+    def duplicates_note(s):
+        if not s.get("duplicates"):
+            return ""
+        return f"{s['duplicates']} duplicate(s) skipped ({human(s['duplicate_bytes'])}). "
 
     def show_success(kind, headline, detail_text, folder):
         _, prog, _, main, detail, open_btn, _ = widgets[kind]
@@ -1478,11 +1621,12 @@ def run_gui():
             return
         paths = list(items.values())
         level, threads = level_names[level_var.get()], core_names[cores_var.get()]
-        sort = sort_names[sort_var.get()]
+        sort, dedupe = sort_names[sort_var.get()], dedupe_var.get()
         log(f"Compressing {len(paths)} item(s) into {out}")
 
         def work(cancel):
             return compress(out, paths, level=level, threads=threads, sort=sort,
+                            skip_duplicates=dedupe,
                             log=log, cancel=cancel,
                             progress=lambda f, t: state.__setitem__("progress", (f, t)))
 
@@ -1492,7 +1636,7 @@ def run_gui():
                 f"{human(s['original'])}  →  {human(s['packed'])}   "
                 f"({s['saved']:.1f}% smaller)",
                 f"{s['files']} file(s) in {s['seconds']:.1f}s. "
-                "Verified: every file is stored exactly.",
+                + duplicates_note(s) + "Verified: every file is stored exactly.",
                 os.path.dirname(os.path.abspath(s["output"])),
             )
 
@@ -1546,8 +1690,9 @@ def run_gui():
             "Replace file?", f"{os.path.basename(out)} already exists. Replace it?"
         ):
             return
-        level, keep = level_names[d_level_var.get()], keep_var.get()
+        level, keep = level_names[level_var.get()], keep_var.get()
         threads, sort = core_names[cores_var.get()], sort_names[sort_var.get()]
+        dedupe = dedupe_var.get()
         parallel, connections = (3, 4) if fast_dl_var.get() else (1, 1)
         log(f"Downloading {len(urls)} link(s) into {out}")
 
@@ -1555,6 +1700,7 @@ def run_gui():
             return download_and_compress(
                 urls, out, level=level, keep_originals=keep, log=log, cancel=cancel,
                 threads=threads, parallel=parallel, connections=connections, sort=sort,
+                skip_duplicates=dedupe,
                 progress=lambda f, t: state.__setitem__("progress", (f, t)))
 
         def success(s):
@@ -1562,8 +1708,9 @@ def run_gui():
                 "download",
                 f"{human(s['original'])}  \u2192  {human(s['packed'])}   "
                 f"({s['saved']:.1f}% smaller)",
-                f"Downloaded {s['files']} file(s) and saved them compressed and verified"
-                + (", plus the uncompressed copies." if keep else "."),
+                f"Downloaded {s['files'] + s['duplicates']} file(s) and saved them "
+                "compressed and verified" + (", plus the uncompressed copies. " if keep else ". ")
+                + duplicates_note(s),
                 os.path.dirname(os.path.abspath(s["output"])),
             )
 
@@ -1594,7 +1741,21 @@ def run_gui():
             return
         if state["cancel"]:
             state["cancel"].set()
-        root.destroy()
+        thread = state["thread"]
+        if thread is None or not thread.is_alive():
+            root.destroy()
+            return
+        # Give the stopped job a moment to delete its half-finished files first.
+        root.title("Core Compressor - stopping...")
+        deadline = time.time() + 15
+
+        def wait():
+            if thread.is_alive() and time.time() < deadline:
+                root.after(100, wait)
+            else:
+                root.destroy()
+
+        wait()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     refresh_summary()
@@ -1632,6 +1793,8 @@ def main(argv=None):
                    help=f"CPU cores to use (default: all {CPU_COUNT})")
     c.add_argument("--sort", choices=list(SORT_MODES), default="none",
                    help="sort files into folders inside the archive")
+    c.add_argument("--skip-duplicates", action="store_true",
+                   help="store identical files only once (extra copies are left out)")
     x = sub.add_parser("extract", help="unpack an archive")
     x.add_argument("archive")
     x.add_argument("dest", nargs="?", help="destination folder (default: next to archive)")
@@ -1644,6 +1807,8 @@ def main(argv=None):
     d.add_argument("--threads", type=int, default=CPU_COUNT, help="CPU cores to use")
     d.add_argument("--sort", choices=list(SORT_MODES), default="none",
                    help="sort files into folders inside the archive")
+    d.add_argument("--skip-duplicates", action="store_true",
+                   help="store identical files only once (extra copies are left out)")
     d.add_argument("--parallel", type=int, default=3, help="files downloaded at once (3)")
     d.add_argument("--connections", type=int, default=4,
                    help="connections per big file (4); use 1 if a site complains")
@@ -1654,14 +1819,14 @@ def main(argv=None):
     try:
         if args.cmd == "compress":
             compress(args.output, args.inputs, level=args.level, threads=args.threads,
-                     sort=args.sort)
+                     sort=args.sort, skip_duplicates=args.skip_duplicates)
         elif args.cmd == "extract":
             extract(args.archive, args.dest)
         elif args.cmd == "download":
             download_and_compress(args.urls, args.output, level=args.level,
                                   keep_originals=args.keep, threads=args.threads,
                                   parallel=args.parallel, connections=args.connections,
-                                  sort=args.sort)
+                                  sort=args.sort, skip_duplicates=args.skip_duplicates)
         else:
             list_archive(args.archive)
     except Exception as e:

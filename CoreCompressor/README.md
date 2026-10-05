@@ -12,9 +12,8 @@ You need Python 3.8 or newer (get it from [python.org](https://www.python.org/do
 
 **Compress tab**
 1. Click **+ Add files** or **+ Add folder**. Add as many as you like; the list shows their sizes.
-2. Pick a compression level. **Best** gives the smallest file; **Fast** is quicker but bigger.
-3. Check where it will be saved (**Save as**), then click **Compress**.
-4. A progress bar shows how far along it is, and you can **Cancel** at any time. When it finishes you see how much smaller it got, and **Open folder** takes you to the archive.
+2. Check where it will be saved (**Save as**), then click **Compress**.
+3. A progress bar shows how far along it is, and you can **Cancel** at any time. When it finishes you see how much smaller it got, and **Open folder** takes you to the archive.
 
 **Extract tab**
 1. Click **Browse...** next to **Archive** and pick a `.tar.xz` file. The list shows what's inside.
@@ -24,7 +23,6 @@ You need Python 3.8 or newer (get it from [python.org](https://www.python.org/do
 **Download tab**
 1. Paste one or more links, one per line (the **Paste link** button pastes from your clipboard).
 2. Click **Download & Compress**. It downloads each file to your computer and saves them all in one compressed, verified archive (in your Downloads folder unless you pick another place).
-3. Tick **Also keep the uncompressed files** if you want the normal files as well.
 
 Links that work:
 - **Google Drive files** shared as "Anyone with the link" (large files too)
@@ -34,7 +32,7 @@ Links that work:
 
 Not supported: private files that need you to log in, and Google Drive *folder* links. For a folder, open it in Drive, select everything and click Download; Drive gives you a ZIP. Also, the file is downloaded at full size first and then compressed, so this saves space on your disk, not download time or data.
 
-The **Details** tab lists every step if you want to see exactly what happened.
+**Settings tab**: all the options are here (see below). The **Details** tab lists every step if you want to see exactly what happened.
 
 Optional: run `pip install tkinterdnd2` to also drag and drop files onto the window.
 
@@ -43,15 +41,37 @@ Optional: run `pip install tkinterdnd2` to also drag and drop files onto the win
 ```
 python core_compressor.py compress MyStuff.tar.xz photo.png "My Folder" notes.txt
 python core_compressor.py compress MyStuff.tar.xz "My Folder" --level fast --threads 4
-python core_compressor.py compress Sorted.tar.xz "Camera Dump" --sort type-date
+python core_compressor.py compress Sorted.tar.xz "Camera Dump" --sort type-date --skip-duplicates
 python core_compressor.py download MyDownloads.tar.xz "https://drive.google.com/file/d/.../view" --keep
 python core_compressor.py list     MyStuff.tar.xz
 python core_compressor.py extract  MyStuff.tar.xz  RestoredFolder
 ```
 
+## Settings
+
+![The Settings tab](settings.png)
+
+| Setting | What it does |
+|---|---|
+| Compression level | **Best** = smallest archive, **Normal**, **Fast** = quickest. For big photo/video collections, Normal or Fast is almost as small and much quicker. |
+| CPU cores | How many processor cores work at once. All is fastest; choose fewer to keep the computer responsive. |
+| Sort files | Arrange files into folders inside the archive (see below). |
+| Skip duplicate files | Identical files are stored only once (see below). |
+| Fast download | Download 3 files at once and split big files over 4 connections. |
+| Also keep the uncompressed files | Keep normal copies of downloads next to the archive. |
+| Remember settings | Keep your choices for next time. They are saved in a small file: `%APPDATA%\CoreCompressor\settings.json` on Windows, `~/Library/Application Support/CoreCompressor` on Mac, `~/.config/CoreCompressor` on Linux. |
+
+**Reset to defaults** puts everything back to how it started.
+
+## Skipping duplicate files
+
+With **Skip duplicate files** on, files with exactly the same content (for example the same video copied into two folders, or downloaded twice) are stored only once. The extra copies are left out of the archive, so when you extract it you get each file once. The file name doesn't matter, only the content. A file is only treated as a duplicate when every byte matches (checked with a SHA-256 fingerprint), so files that merely look alike are always kept.
+
+The archive keeps a list of which copies were skipped and which identical file was kept (you can see it in the **Details** tab while compressing). It's quick too: only files that have exactly the same size as another file are checked.
+
 ## Sorting files into folders
 
-The **Sort files** setting (Compress and Download tabs) arranges the files into folders inside the archive, so they come out sorted when you extract it. Your original files are never moved or changed.
+The **Sort files** setting arranges the files into folders inside the archive, so they come out sorted when you extract it. Your original files are never moved or changed.
 
 | Setting | Example of where a file ends up |
 |---|---|
@@ -68,9 +88,9 @@ The date is the date the photo or video was **taken**. It is read from inside th
 
 ## Speed settings
 
-- **CPU cores** (Compress and Download tabs): by default every core of your processor compresses at the same time. On a 4-core test machine that was about 3× faster than one core. Choose fewer cores if you want to keep using the computer smoothly while it works, or if it runs low on memory ("Best" uses about 200 MB per core).
+- **CPU cores**: by default every core of your processor compresses at the same time. On a 4-core test machine that was about 3× faster than one core. Choose fewer cores if you want to keep using the computer smoothly while it works, or if it runs low on memory ("Best" uses about 200 MB per core).
 - **Already-compressed data is detected automatically.** Videos, PNGs and most RAW photos are already compressed, so compressing them again takes ages and saves almost nothing. The program checks each piece and stores those pieces as they are. In testing this went from about 3–5 MB/s to about 85 MB/s, so on videos the speed now depends on your disk, not the CPU.
-- **Fast download** (Download tab, on by default): downloads 3 files at the same time and splits each big file over 4 connections. On a 475 MB Google Drive file that was more than twice as fast as a normal download. Turn it off if a website complains or blocks you.
+- **Fast download** (on by default): downloads 3 files at the same time and splits each big file over 4 connections. On a 475 MB Google Drive file that was more than twice as fast as a normal download. Turn it off if a website complains or blocks you.
 - **Graphics card:** not used. No GPU method makes this kind of lossless compression or downloading faster: downloads are limited by your internet connection, and the CPU tricks above give the real speed-up.
 
 ## Why nothing is lost
