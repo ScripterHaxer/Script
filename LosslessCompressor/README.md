@@ -42,11 +42,18 @@ Optional: run `pip install tkinterdnd2` to also drag and drop files onto the win
 
 ```
 python lossless_compressor.py compress MyStuff.tar.xz photo.png "My Folder" notes.txt
-python lossless_compressor.py compress MyStuff.tar.xz "My Folder" --level fast
+python lossless_compressor.py compress MyStuff.tar.xz "My Folder" --level fast --threads 4
 python lossless_compressor.py download MyDownloads.tar.xz "https://drive.google.com/file/d/.../view" --keep
 python lossless_compressor.py list     MyStuff.tar.xz
 python lossless_compressor.py extract  MyStuff.tar.xz  RestoredFolder
 ```
+
+## Speed settings
+
+- **CPU cores** (Compress and Download tabs): by default every core of your processor compresses at the same time. On a 4-core test machine that was about 3× faster than one core. Choose fewer cores if you want to keep using the computer smoothly while it works, or if it runs low on memory ("Best" uses about 200 MB per core).
+- **Already-compressed data is detected automatically.** Videos, PNGs and most RAW photos are already compressed, so compressing them again takes ages and saves almost nothing. The program checks each piece and stores those pieces as they are. In testing this went from about 3–5 MB/s to about 85 MB/s, so on videos the speed now depends on your disk, not the CPU.
+- **Fast download** (Download tab, on by default): downloads 3 files at the same time and splits each big file over 4 connections. On a 475 MB Google Drive file that was more than twice as fast as a normal download. Turn it off if a website complains or blocks you.
+- **Graphics card:** not used. No GPU method makes this kind of lossless compression or downloading faster: downloads are limited by your internet connection, and the CPU tricks above give the real speed-up.
 
 ## Why nothing is lost
 

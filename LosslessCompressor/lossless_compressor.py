@@ -29,13 +29,18 @@ import lzma
 import os
 import re
 import shutil
+import struct
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 MANIFEST_NAME = ".lossless_manifest.json"
 EXTENSION = ".tar.xz"
@@ -45,6 +50,9 @@ LEVELS = {
     "normal": 6,
     "fast": 1,
 }
+CPU_COUNT = os.cpu_count() or 1
+BLOCK_SIZE = 16 * 1024 * 1024  # each block is compressed on its own CPU core
+BEST_MAX_THREADS = 8  # "best" needs ~200 MB of memory per core
 # Extraction filter (Python 3.11.4+). Paths are also checked by _check_safe.
 EXTRACT_KW = {"filter": "tar"} if hasattr(tarfile, "tar_filter") else {}
 
@@ -93,6 +101,114 @@ class _Reader:
 
     def readable(self):
         return True
+
+
+# ----------------------------------------------------------------------------- multi-core xz
+
+def _vli(n):
+    out = bytearray()
+    while n >= 0x80:
+        out.append((n & 0x7F) | 0x80)
+        n >>= 7
+    out.append(n)
+    return bytes(out)
+
+
+def _stored_xz(data):
+    """A standard .xz stream that holds data without compressing it (LZMA2 "stored"
+    chunks). Used for data that is already compressed, such as video, PNG and most
+    RAW photos: trying to compress it again takes ages and saves almost nothing."""
+    crc = zlib.crc32
+    flags = b"\x00\x01"  # check type CRC32
+    out = [b"\xfd7zXZ\x00", flags, struct.pack("<I", crc(flags))]
+    # Block header: size, flags, LZMA2 filter id, 1 property byte (128 KiB dictionary).
+    header = bytes([2, 0x00, 0x21, 0x01, 10]) + b"\x00" * 3
+    header += struct.pack("<I", crc(header))
+    body = bytearray()
+    for i in range(0, len(data), 65536):
+        piece = data[i:i + 65536]
+        body += bytes([1 if i == 0 else 2]) + struct.pack(">H", len(piece) - 1) + piece
+    body += b"\x00"
+    unpadded = len(header) + len(body) + 4
+    out += [header, bytes(body), b"\x00" * (-len(body) % 4), struct.pack("<I", crc(data))]
+    index = b"\x00" + _vli(1) + _vli(unpadded) + _vli(len(data))
+    index += b"\x00" * (-len(index) % 4)
+    index += struct.pack("<I", crc(index))
+    backward = struct.pack("<I", len(index) // 4 - 1) + flags
+    out += [index, struct.pack("<I", crc(backward)), backward, b"YZ"]
+    return b"".join(out)
+
+
+def _looks_compressed(data, samples=3, size=128 * 1024):
+    """Quick test on a few small samples: does this block barely compress?"""
+    if len(data) < 4 * size:
+        return False
+    step = (len(data) - size) // (samples - 1)
+    sample = b"".join(data[i * step:i * step + size] for i in range(samples))
+    return len(lzma.compress(sample, preset=0)) > 0.97 * len(sample)
+
+
+def _compress_block(data, filters):
+    if _looks_compressed(data):
+        return _stored_xz(data), True
+    return lzma.compress(data, format=lzma.FORMAT_XZ, filters=filters), False
+
+
+class _ParallelXZ:
+    """Write-only file object: cuts the stream into blocks, compresses them on several
+    CPU cores at once, and writes the results in order. Each block becomes its own
+    .xz stream; streams placed one after another are still one valid .xz file."""
+
+    def __init__(self, raw, level, threads):
+        self.raw = raw
+        self.filters = [{"id": lzma.FILTER_LZMA2, "preset": LEVELS[level]}]
+        if level == "best":  # its 64 MB dictionary is bigger than a block; cap it to save memory
+            self.filters[0]["dict_size"] = BLOCK_SIZE
+        if level == "best":
+            threads = min(threads, BEST_MAX_THREADS)
+        self.threads = max(1, threads)
+        self.pool = ThreadPoolExecutor(self.threads)
+        self.pending = deque()
+        self.buf = bytearray()
+        self.pos = 0
+        self.stored_bytes = 0
+
+    def write(self, data):
+        self.buf += data
+        self.pos += len(data)
+        while len(self.buf) >= BLOCK_SIZE:
+            self._submit(bytes(self.buf[:BLOCK_SIZE]))
+            del self.buf[:BLOCK_SIZE]
+        return len(data)
+
+    def tell(self):
+        return self.pos
+
+    def _submit(self, block):
+        self.pending.append((len(block), self.pool.submit(_compress_block, block, self.filters)))
+        while len(self.pending) > self.threads * 2:
+            self._write_oldest()
+
+    def _write_oldest(self):
+        size, future = self.pending.popleft()
+        data, stored = future.result()
+        if stored:
+            self.stored_bytes += size
+        self.raw.write(data)
+
+    def finish(self):
+        if self.buf:
+            self._submit(bytes(self.buf))
+            self.buf.clear()
+        while self.pending:
+            self._write_oldest()
+        self.pool.shutdown()
+
+    def abort(self):
+        for _, future in self.pending:
+            future.cancel()
+        self.pending.clear()
+        self.pool.shutdown()
 
 
 def sha256_stream(fileobj, cancel=None, on_read=_noop):
@@ -144,8 +260,33 @@ def _is_regular(path):
     return os.path.isfile(path) and not os.path.islink(path)
 
 
-def compress(output, inputs, level="best", log=print, progress=_noop, cancel=None):
-    """Create an archive. progress(fraction, text) is called as work proceeds."""
+def _add_entries(tar, entries, manifest, log, on_read, cancel):
+    for src, arcname in entries:
+        if cancel is not None and cancel.is_set():
+            raise Cancelled()
+        info = tar.gettarinfo(src, arcname)
+        if info is None:  # sockets, devices, etc.
+            log(f"  skipped (unsupported type): {src}")
+            continue
+        if info.isreg():
+            h = hashlib.sha256()
+            with open(src, "rb") as f:
+                tar.addfile(info, _Reader(f, on_read, cancel, h))
+            manifest["files"][arcname] = {"sha256": h.hexdigest(), "size": info.size}
+            log(f"  added {arcname} ({human(info.size)})")
+        else:
+            tar.addfile(info)
+    data = json.dumps(manifest, indent=1).encode("utf-8")
+    minfo = tarfile.TarInfo(MANIFEST_NAME)
+    minfo.size = len(data)
+    minfo.mtime = int(time.time())
+    tar.addfile(minfo, io.BytesIO(data))
+
+
+def compress(output, inputs, level="best", log=print, progress=_noop, cancel=None,
+             threads=CPU_COUNT):
+    """Create an archive. progress(fraction, text) is called as work proceeds.
+    threads = how many CPU cores compress at the same time."""
     if not output.endswith(EXTENSION):
         output += EXTENSION
     out_abs = os.path.abspath(output)
@@ -155,7 +296,6 @@ def compress(output, inputs, level="best", log=print, progress=_noop, cancel=Non
     total = sum(os.path.getsize(src) for src, _ in entries if _is_regular(src)) or 1
 
     manifest = {"format": 1, "created": time.time(), "files": {}}
-    original_size = 0
     start = time.time()
     done = 0
 
@@ -165,28 +305,21 @@ def compress(output, inputs, level="best", log=print, progress=_noop, cancel=Non
         progress(0.85 * done / total, f"Compressing... {human(done)} of {human(total)}")
 
     try:
-        with tarfile.open(part, "w:xz", preset=LEVELS[level]) as tar:
-            for src, arcname in entries:
-                if cancel is not None and cancel.is_set():
-                    raise Cancelled()
-                info = tar.gettarinfo(src, arcname)
-                if info is None:  # sockets, devices, etc.
-                    log(f"  skipped (unsupported type): {src}")
-                    continue
-                if info.isreg():
-                    h = hashlib.sha256()
-                    with open(src, "rb") as f:
-                        tar.addfile(info, _Reader(f, on_read, cancel, h))
-                    manifest["files"][arcname] = {"sha256": h.hexdigest(), "size": info.size}
-                    original_size += info.size
-                    log(f"  added {arcname} ({human(info.size)})")
-                else:
-                    tar.addfile(info)
-            data = json.dumps(manifest, indent=1).encode("utf-8")
-            minfo = tarfile.TarInfo(MANIFEST_NAME)
-            minfo.size = len(data)
-            minfo.mtime = int(time.time())
-            tar.addfile(minfo, io.BytesIO(data))
+        with open(part, "wb") as raw:
+            xz = _ParallelXZ(raw, level, threads)
+            log(f"Using {xz.threads} CPU core(s).")
+            try:
+                tar = tarfile.open(fileobj=xz, mode="w")
+                _add_entries(tar, entries, manifest, log, on_read, cancel)
+                tar.close()
+                xz.finish()
+            except BaseException:
+                xz.abort()
+                raise
+        original_size = sum(meta["size"] for meta in manifest["files"].values())
+        if xz.stored_bytes:
+            log(f"{human(xz.stored_bytes)} was already compressed (video, PNG, RAW...) "
+                "and was stored as-is to save time.")
 
         log("Verifying archive against the original files...")
         problems = verify(part, progress=progress, cancel=cancel, base=0.85, span=0.15)
@@ -402,10 +535,55 @@ def _unique_path(folder, name):
     return path
 
 
-def download(url, folder, log=print, progress=_noop, cancel=None):
-    """Download one link into folder. progress(fraction or None, text). Returns the path."""
+SPLIT_MIN = 32 * 1024 * 1024  # files at least this big are fetched over several connections
+USER_AGENT = {"User-Agent": "Mozilla/5.0 LosslessCompressor"}
+_name_lock = threading.Lock()
+
+
+class _AnyEvent:
+    """Looks like a threading.Event that is set when any of the given events is set."""
+
+    def __init__(self, *events):
+        self.events = [e for e in events if e is not None]
+
+    def is_set(self):
+        return any(e.is_set() for e in self.events)
+
+
+def _fetch_range(url, path, start, end, add, cancel, attempts=4):
+    """Download bytes start..end (inclusive) into the same place in path, retrying."""
+    pos = start
+    for attempt in range(attempts):
+        try:
+            req = urllib.request.Request(url, headers={**USER_AGENT, "Range": f"bytes={pos}-{end}"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if r.status != 206:
+                    raise RuntimeError("the server does not support split downloads")
+                with open(path, "r+b") as f:
+                    f.seek(pos)
+                    while pos <= end:
+                        if cancel is not None and cancel.is_set():
+                            raise Cancelled()
+                        block = r.read(min(CHUNK, end - pos + 1))
+                        if not block:
+                            raise ConnectionError("connection closed early")
+                        f.write(block)
+                        pos += len(block)
+                        add(len(block))
+            return
+        except (Cancelled, RuntimeError):
+            raise
+        except Exception:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(2 ** attempt)
+
+
+def download(url, folder, log=print, progress=_noop, cancel=None, connections=1):
+    """Download one link into folder. progress(fraction or None, text). Returns the path.
+    Big files are fetched over `connections` connections at once when the server allows."""
     direct = resolve_url(url)
-    req = urllib.request.Request(direct, headers={"User-Agent": "Mozilla/5.0 LosslessCompressor"})
+    req = urllib.request.Request(direct, headers=USER_AGENT)
     progress(None, f"Connecting to {urllib.parse.urlparse(direct).netloc}...")
     try:
         resp = urllib.request.urlopen(req, timeout=60)
@@ -417,6 +595,8 @@ def download(url, folder, log=print, progress=_noop, cancel=None):
     except urllib.error.URLError as e:
         raise RuntimeError(f"Could not connect for {url}: {e.reason}") from None
 
+    lock = threading.Lock()
+    done = 0
     with resp:
         ctype = resp.headers.get("Content-Type", "")
         if "google" in direct and ctype.startswith("text/html"):
@@ -426,37 +606,73 @@ def download(url, folder, log=print, progress=_noop, cancel=None):
             )
         name = _filename_from_response(resp, direct)
         total = int(resp.headers.get("Content-Length") or 0)
-        path = _unique_path(folder, name)
-        log(f"  downloading {name}" + (f" ({human(total)})" if total else ""))
-        done = 0
+        split = (connections > 1 and total >= SPLIT_MIN
+                 and resp.headers.get("Accept-Ranges", "").lower() == "bytes")
+        with _name_lock:  # several downloads may pick a name at the same moment
+            path = _unique_path(folder, name)
+            open(path, "wb").close()
+        log(f"  downloading {name}" + (f" ({human(total)})" if total else "")
+            + (f" over {connections} connections" if split else ""))
+
+        def add(n):
+            nonlocal done
+            with lock:
+                done += n
+                current = done
+            text = f"Downloading {name}... {human(current)}"
+            if total:
+                progress(min(current / total, 1.0), text + f" of {human(total)}")
+            else:
+                progress(None, text)
+
         try:
-            with open(path, "wb") as out:
-                while True:
-                    if cancel is not None and cancel.is_set():
-                        raise Cancelled()
-                    block = resp.read(CHUNK)
-                    if not block:
-                        break
-                    out.write(block)
-                    done += len(block)
-                    text = f"Downloading {name}... {human(done)}"
-                    if total:
-                        progress(min(done / total, 1.0), text + f" of {human(total)}")
-                    else:
-                        progress(None, text)
+            if not split:
+                with open(path, "wb") as out:
+                    while True:
+                        if cancel is not None and cancel.is_set():
+                            raise Cancelled()
+                        block = resp.read(CHUNK)
+                        if not block:
+                            break
+                        out.write(block)
+                        add(len(block))
         except BaseException:
             os.remove(path)
             raise
-        if total and done < total:
+
+    if split:
+        try:
+            with open(path, "r+b") as f:
+                f.truncate(total)
+            step = -(-total // connections)
+            ranges = [(a, min(a + step, total) - 1) for a in range(0, total, step)]
+            stop = threading.Event()
+            either = _AnyEvent(cancel, stop)
+            with ThreadPoolExecutor(len(ranges)) as pool:
+                futures = [pool.submit(_fetch_range, direct, path, a, b, add, either)
+                           for a, b in ranges]
+                try:
+                    for fut in futures:
+                        fut.result()
+                except BaseException:
+                    stop.set()
+                    raise
+        except BaseException:
             os.remove(path)
-            raise RuntimeError(f"Download of {name} was cut off ({human(done)} of {human(total)}).")
+            raise
+
+    if total and done < total:
+        os.remove(path)
+        raise RuntimeError(f"Download of {name} was cut off ({human(done)} of {human(total)}).")
     log(f"  downloaded {name} ({human(done)})")
     return path
 
 
-def download_and_compress(urls, output, level="best", keep_originals=False,
-                          log=print, progress=_noop, cancel=None):
-    """Download every link, then pack them all into one verified archive."""
+def download_and_compress(urls, output, level="best", keep_originals=False, log=print,
+                          progress=_noop, cancel=None, threads=CPU_COUNT,
+                          parallel=1, connections=1):
+    """Download every link (`parallel` at a time), then pack them all into one verified
+    archive using `threads` CPU cores."""
     urls = [u.strip() for u in urls if u.strip()]
     if not urls:
         raise ValueError("No links given.")
@@ -465,19 +681,35 @@ def download_and_compress(urls, output, level="best", keep_originals=False,
     folder = os.path.dirname(os.path.abspath(output))
     os.makedirs(folder, exist_ok=True)
     work = tempfile.mkdtemp(prefix=".downloading-", dir=folder)
+    fractions = [0.0] * len(urls)
+    stop = threading.Event()
+    either = _AnyEvent(cancel, stop)
+
+    def fetch(i, url):
+        log(f"Link {i + 1} of {len(urls)}: {url}")
+
+        def step(frac, text):
+            if frac is not None:
+                fractions[i] = frac
+            busy = sum(1 for f in fractions if 0 < f < 1)
+            if busy > 1:
+                text = f"Downloading {busy} files at once..."
+            progress(0.5 * sum(fractions) / len(urls), text)
+
+        return download(url, work, log=log, progress=step, cancel=either,
+                        connections=connections)
+
     try:
-        files = []
-        for i, url in enumerate(urls):
-            log(f"Link {i + 1} of {len(urls)}: {url}")
-
-            def step(frac, text, i=i):
-                overall = None if frac is None else 0.5 * (i + frac) / len(urls)
-                progress(overall, text)
-
-            files.append(download(url, work, log=log, progress=step, cancel=cancel))
+        with ThreadPoolExecutor(max(1, min(parallel, len(urls)))) as pool:
+            futures = [pool.submit(fetch, i, u) for i, u in enumerate(urls)]
+            try:
+                files = [f.result() for f in futures]
+            except BaseException:
+                stop.set()
+                raise
 
         log(f"Compressing {len(files)} downloaded file(s)...")
-        stats = compress(output, files, level=level, log=log, cancel=cancel,
+        stats = compress(output, files, level=level, log=log, cancel=cancel, threads=threads,
                          progress=lambda f, t: progress(0.5 + 0.5 * f, t))
         if keep_originals:
             for f in files:
@@ -763,11 +995,22 @@ def run_gui():
         "Fast: bigger file (quicker)": "fast",
     }
     level_var = tk.StringVar(value=next(iter(level_names)))
+    core_names = {f"All {CPU_COUNT} (fastest)": CPU_COUNT}
+    core_names.setdefault(f"Half ({max(1, CPU_COUNT // 2)})", max(1, CPU_COUNT // 2))
+    core_names.setdefault("1 (uses least memory)", 1)
+    cores_var = tk.StringVar(value=next(iter(core_names)))  # shared by both tabs
+
+    def cores_picker(parent):
+        ttk.Label(parent, text="CPU cores:").pack(side="left", padx=(16, 6))
+        ttk.Combobox(parent, textvariable=cores_var, values=list(core_names),
+                     state="readonly", width=22).pack(side="left")
+
     level_row = ttk.Frame(ctab)
     ttk.Label(level_row, text="Compression:", width=12).pack(side="left")
     ttk.Combobox(
         level_row, textvariable=level_var, values=list(level_names), state="readonly", width=30
     ).pack(side="left")
+    cores_picker(level_row)
 
     def browse_output():
         p = filedialog.asksaveasfilename(
@@ -911,7 +1154,12 @@ def run_gui():
     ttk.Combobox(d_level_row, textvariable=d_level_var, values=list(level_names),
                  state="readonly", width=30).pack(side="left")
     keep_var = tk.BooleanVar(value=False)
-    ttk.Checkbutton(d_level_row, text="Also keep the uncompressed files",
+    cores_picker(d_level_row)
+    d_speed_row = ttk.Frame(dtab)
+    fast_dl_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(d_speed_row, text="Fast download (3 files at once, 4 connections per file)",
+                    variable=fast_dl_var).pack(side="left")
+    ttk.Checkbutton(d_speed_row, text="Also keep the uncompressed files",
                     variable=keep_var).pack(side="left", padx=16)
 
     def browse_d_output():
@@ -942,6 +1190,7 @@ def run_gui():
     d_status.pack(side="bottom", fill="x", pady=(4, 0))
     d_action.pack(side="bottom", fill="x", pady=(12, 0))
     d_out_row.pack(side="bottom", fill="x", pady=(8, 0))
+    d_speed_row.pack(side="bottom", fill="x", pady=(8, 0))
     d_level_row.pack(side="bottom", fill="x", pady=(10, 0))
     link_buttons.pack(side="bottom", fill="x", pady=(6, 0))
     links_frame.pack(fill="both", expand=True, pady=(8, 0))
@@ -1024,11 +1273,11 @@ def run_gui():
         ):
             return
         paths = list(items.values())
-        level = level_names[level_var.get()]
+        level, threads = level_names[level_var.get()], core_names[cores_var.get()]
         log(f"Compressing {len(paths)} item(s) into {out}")
 
         def work(cancel):
-            return compress(out, paths, level=level, log=log, cancel=cancel,
+            return compress(out, paths, level=level, threads=threads, log=log, cancel=cancel,
                             progress=lambda f, t: state.__setitem__("progress", (f, t)))
 
         def success(s):
@@ -1092,11 +1341,14 @@ def run_gui():
         ):
             return
         level, keep = level_names[d_level_var.get()], keep_var.get()
+        threads = core_names[cores_var.get()]
+        parallel, connections = (3, 4) if fast_dl_var.get() else (1, 1)
         log(f"Downloading {len(urls)} link(s) into {out}")
 
         def work(cancel):
             return download_and_compress(
                 urls, out, level=level, keep_originals=keep, log=log, cancel=cancel,
+                threads=threads, parallel=parallel, connections=connections,
                 progress=lambda f, t: state.__setitem__("progress", (f, t)))
 
         def success(s):
@@ -1170,6 +1422,8 @@ def main(argv=None):
     c.add_argument("inputs", nargs="+", help="files and folders to include")
     c.add_argument("--level", choices=list(LEVELS), default="best",
                    help="best = smallest (default), fast = quickest")
+    c.add_argument("--threads", type=int, default=CPU_COUNT,
+                   help=f"CPU cores to use (default: all {CPU_COUNT})")
     x = sub.add_parser("extract", help="unpack an archive")
     x.add_argument("archive")
     x.add_argument("dest", nargs="?", help="destination folder (default: next to archive)")
@@ -1179,18 +1433,23 @@ def main(argv=None):
     d.add_argument("urls", nargs="+", help="share links or direct download links")
     d.add_argument("--level", choices=list(LEVELS), default="best")
     d.add_argument("--keep", action="store_true", help="also keep the uncompressed downloads")
+    d.add_argument("--threads", type=int, default=CPU_COUNT, help="CPU cores to use")
+    d.add_argument("--parallel", type=int, default=3, help="files downloaded at once (3)")
+    d.add_argument("--connections", type=int, default=4,
+                   help="connections per big file (4); use 1 if a site complains")
     l = sub.add_parser("list", help="show what is inside an archive")
     l.add_argument("archive")
     args = parser.parse_args(argv)
 
     try:
         if args.cmd == "compress":
-            compress(args.output, args.inputs, level=args.level)
+            compress(args.output, args.inputs, level=args.level, threads=args.threads)
         elif args.cmd == "extract":
             extract(args.archive, args.dest)
         elif args.cmd == "download":
             download_and_compress(args.urls, args.output, level=args.level,
-                                  keep_originals=args.keep)
+                                  keep_originals=args.keep, threads=args.threads,
+                                  parallel=args.parallel, connections=args.connections)
         else:
             list_archive(args.archive)
     except Exception as e:
