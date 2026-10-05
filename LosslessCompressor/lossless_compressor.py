@@ -27,9 +27,15 @@ import io
 import json
 import lzma
 import os
+import re
+import shutil
 import sys
 import tarfile
+import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 MANIFEST_NAME = ".lossless_manifest.json"
 EXTENSION = ".tar.xz"
@@ -321,6 +327,165 @@ def extract(archive, dest=None, log=print, progress=_noop, cancel=None):
         f"Every file is byte-for-byte identical to the original."
     )
     return stats
+
+
+# ----------------------------------------------------------------------------- downloads
+
+GOOGLE_EXPORTS = {  # Google Docs editors files are exported to Office formats
+    "document": "docx",
+    "spreadsheets": "xlsx",
+    "presentation": "pptx",
+}
+
+
+def resolve_url(url):
+    """Turn a share link (Google Drive, Docs, Dropbox) into a direct download link."""
+    url = url.strip()
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        url = "https://" + url
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    query = urllib.parse.parse_qs(parsed.query)
+
+    if host == "docs.google.com":
+        m = re.match(r"/(document|spreadsheets|presentation)/d/([\w-]+)", parsed.path)
+        if m:
+            kind, file_id = m.groups()
+            return f"https://docs.google.com/{kind}/d/{file_id}/export?format={GOOGLE_EXPORTS[kind]}"
+    if host in ("drive.google.com", "docs.google.com", "drive.usercontent.google.com"):
+        if "/folders/" in parsed.path:
+            raise ValueError(
+                "Google Drive folder links can't be downloaded directly. Open the folder, "
+                "select everything, choose Download (Drive makes a ZIP), or share the "
+                "individual files."
+            )
+        m = re.search(r"/file/d/([\w-]+)", parsed.path)
+        file_id = m.group(1) if m else (query.get("id") or [None])[0]
+        if file_id:
+            return (
+                "https://drive.usercontent.google.com/download?"
+                f"id={file_id}&export=download&confirm=t"
+            )
+    if host.endswith("dropbox.com"):
+        query["dl"] = ["1"]
+        return urllib.parse.urlunparse(
+            parsed._replace(query=urllib.parse.urlencode(query, doseq=True))
+        )
+    return url
+
+
+def _filename_from_response(resp, url):
+    name = None
+    cd = resp.headers.get("Content-Disposition", "")
+    m = re.search(r"filename\*\s*=\s*[^']*'[^']*'([^;]+)", cd)
+    if m:
+        name = urllib.parse.unquote(m.group(1).strip().strip('"'))
+    else:
+        m = re.search(r'filename\s*=\s*"?([^";]+)"?', cd)
+        if m:
+            name = m.group(1).strip()
+    if not name:
+        name = urllib.parse.unquote(os.path.basename(urllib.parse.urlparse(resp.url).path))
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip(" .")
+    return name or "download"
+
+
+def _unique_path(folder, name):
+    path = os.path.join(folder, name)
+    stem, ext = os.path.splitext(name)
+    if name.endswith(EXTENSION):
+        stem, ext = name[: -len(EXTENSION)], EXTENSION
+    i = 2
+    while os.path.exists(path):
+        path = os.path.join(folder, f"{stem} ({i}){ext}")
+        i += 1
+    return path
+
+
+def download(url, folder, log=print, progress=_noop, cancel=None):
+    """Download one link into folder. progress(fraction or None, text). Returns the path."""
+    direct = resolve_url(url)
+    req = urllib.request.Request(direct, headers={"User-Agent": "Mozilla/5.0 LosslessCompressor"})
+    progress(None, f"Connecting to {urllib.parse.urlparse(direct).netloc}...")
+    try:
+        resp = urllib.request.urlopen(req, timeout=60)
+    except urllib.error.HTTPError as e:
+        hint = ""
+        if e.code in (401, 403, 404) and "google" in direct:
+            hint = ' Make sure the file is shared as "Anyone with the link".'
+        raise RuntimeError(f"Download failed ({e.code} {e.reason}) for {url}.{hint}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Could not connect for {url}: {e.reason}") from None
+
+    with resp:
+        ctype = resp.headers.get("Content-Type", "")
+        if "google" in direct and ctype.startswith("text/html"):
+            raise RuntimeError(
+                f"Google returned a web page instead of the file for {url}. The file is "
+                'probably private: share it as "Anyone with the link" and try again.'
+            )
+        name = _filename_from_response(resp, direct)
+        total = int(resp.headers.get("Content-Length") or 0)
+        path = _unique_path(folder, name)
+        log(f"  downloading {name}" + (f" ({human(total)})" if total else ""))
+        done = 0
+        try:
+            with open(path, "wb") as out:
+                while True:
+                    if cancel is not None and cancel.is_set():
+                        raise Cancelled()
+                    block = resp.read(CHUNK)
+                    if not block:
+                        break
+                    out.write(block)
+                    done += len(block)
+                    text = f"Downloading {name}... {human(done)}"
+                    if total:
+                        progress(min(done / total, 1.0), text + f" of {human(total)}")
+                    else:
+                        progress(None, text)
+        except BaseException:
+            os.remove(path)
+            raise
+        if total and done < total:
+            os.remove(path)
+            raise RuntimeError(f"Download of {name} was cut off ({human(done)} of {human(total)}).")
+    log(f"  downloaded {name} ({human(done)})")
+    return path
+
+
+def download_and_compress(urls, output, level="best", keep_originals=False,
+                          log=print, progress=_noop, cancel=None):
+    """Download every link, then pack them all into one verified archive."""
+    urls = [u.strip() for u in urls if u.strip()]
+    if not urls:
+        raise ValueError("No links given.")
+    if not output.endswith(EXTENSION):
+        output += EXTENSION
+    folder = os.path.dirname(os.path.abspath(output))
+    os.makedirs(folder, exist_ok=True)
+    work = tempfile.mkdtemp(prefix=".downloading-", dir=folder)
+    try:
+        files = []
+        for i, url in enumerate(urls):
+            log(f"Link {i + 1} of {len(urls)}: {url}")
+
+            def step(frac, text, i=i):
+                overall = None if frac is None else 0.5 * (i + frac) / len(urls)
+                progress(overall, text)
+
+            files.append(download(url, work, log=log, progress=step, cancel=cancel))
+
+        log(f"Compressing {len(files)} downloaded file(s)...")
+        stats = compress(output, files, level=level, log=log, cancel=cancel,
+                         progress=lambda f, t: progress(0.5 + 0.5 * f, t))
+        if keep_originals:
+            for f in files:
+                shutil.move(f, _unique_path(folder, os.path.basename(f)))
+            log(f"Kept the original downloads in {folder}")
+        return stats
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def contents(archive):
@@ -707,6 +872,80 @@ def run_gui():
     x_action.pack(side="bottom", fill="x", pady=(12, 0))
     xtree_frame.pack(fill="both", expand=True, pady=(6, 0))
 
+    # ---- Download tab
+    dtab = ttk.Frame(notebook, padding=14)
+    notebook.add(dtab, text="Download")
+    ttk.Label(dtab, text="Download from links and save them compressed",
+              style="Big.TLabel").pack(anchor="w")
+    ttk.Label(
+        dtab,
+        text="Paste one link per line. Works with Google Drive and Google Docs files shared "
+        "as \"Anyone with the link\", Dropbox, and direct download links.",
+        style="Hint.TLabel", wraplength=780, justify="left",
+    ).pack(anchor="w", pady=(2, 0))
+    links_frame = ttk.Frame(dtab)
+    links = tk.Text(links_frame, height=6, wrap="none", relief="solid", borderwidth=1,
+                    font=(family, size), undo=True)
+    links_bar = ttk.Scrollbar(links_frame, orient="vertical", command=links.yview)
+    links.configure(yscrollcommand=links_bar.set)
+    links.pack(side="left", fill="both", expand=True)
+    links_bar.pack(side="right", fill="y")
+
+    def paste_links():
+        try:
+            text = root.clipboard_get()
+        except tk.TclError:
+            return
+        if links.get("1.0", "end-1c").strip():
+            links.insert("end", "\n")
+        links.insert("end", text.strip())
+
+    link_buttons = ttk.Frame(dtab)
+    ttk.Button(link_buttons, text="Paste link", command=paste_links).pack(side="left")
+    ttk.Button(link_buttons, text="Clear",
+               command=lambda: links.delete("1.0", "end")).pack(side="left", padx=6)
+
+    d_level_var = tk.StringVar(value=next(iter(level_names)))
+    d_level_row = ttk.Frame(dtab)
+    ttk.Label(d_level_row, text="Compression:", width=12).pack(side="left")
+    ttk.Combobox(d_level_row, textvariable=d_level_var, values=list(level_names),
+                 state="readonly", width=30).pack(side="left")
+    keep_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(d_level_row, text="Also keep the uncompressed files",
+                    variable=keep_var).pack(side="left", padx=16)
+
+    def browse_d_output():
+        p = filedialog.asksaveasfilename(
+            title="Save compressed downloads as",
+            defaultextension=EXTENSION,
+            initialfile=os.path.basename(d_out_var.get()),
+            initialdir=os.path.dirname(d_out_var.get()),
+            filetypes=[("Compressed archive", "*" + EXTENSION)],
+        )
+        if p:
+            d_out_var.set(p)
+
+    d_out_row, d_out_var = path_row(dtab, "Save as:", browse_d_output)
+    downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+    if not os.path.isdir(downloads_dir):
+        downloads_dir = os.path.expanduser("~")
+    d_out_var.set(os.path.join(downloads_dir, "Downloads" + EXTENSION))
+
+    d_action = ttk.Frame(dtab)
+    d_button = ttk.Button(d_action, text="Download & Compress", style="Accent.TButton")
+    d_button.pack(side="right")
+    d_prog = ttk.Progressbar(d_action, maximum=1000)
+    d_prog.pack(side="left", fill="x", expand=True, padx=(0, 12))
+    d_status = ttk.Label(dtab, text="", style="Hint.TLabel")
+    d_result, d_main, d_detail, d_open = result_area(dtab)
+    d_result.pack(side="bottom", fill="x", pady=(6, 0))
+    d_status.pack(side="bottom", fill="x", pady=(4, 0))
+    d_action.pack(side="bottom", fill="x", pady=(12, 0))
+    d_out_row.pack(side="bottom", fill="x", pady=(8, 0))
+    d_level_row.pack(side="bottom", fill="x", pady=(10, 0))
+    link_buttons.pack(side="bottom", fill="x", pady=(6, 0))
+    links_frame.pack(fill="both", expand=True, pady=(8, 0))
+
     # ---- Details tab
     ltab = ttk.Frame(notebook, padding=14)
     notebook.add(ltab, text="Details")
@@ -718,6 +957,8 @@ def run_gui():
     widgets = {
         "compress": (c_button, c_prog, c_status, c_main, c_detail, c_open, "Compress"),
         "extract": (x_button, x_prog, x_status, x_main, x_detail, x_open, "Extract"),
+        "download": (d_button, d_prog, d_status, d_main, d_detail, d_open,
+                     "Download & Compress"),
     }
 
     def start_job(kind, work, on_success):
@@ -830,6 +1071,48 @@ def run_gui():
     c_button.configure(command=on_compress_click)
     x_button.configure(command=on_extract_click)
 
+    def on_download_click():
+        if state["busy"] == "download":
+            state["cancel"].set()
+            return
+        urls = [u.strip() for u in links.get("1.0", "end").splitlines() if u.strip()]
+        if not urls:
+            messagebox.showinfo("No links", "Paste at least one link first.")
+            return
+        out = d_out_var.get().strip()
+        if not out:
+            browse_d_output()
+            out = d_out_var.get().strip()
+            if not out:
+                return
+        if not out.endswith(EXTENSION):
+            out += EXTENSION
+        if os.path.exists(out) and not messagebox.askyesno(
+            "Replace file?", f"{os.path.basename(out)} already exists. Replace it?"
+        ):
+            return
+        level, keep = level_names[d_level_var.get()], keep_var.get()
+        log(f"Downloading {len(urls)} link(s) into {out}")
+
+        def work(cancel):
+            return download_and_compress(
+                urls, out, level=level, keep_originals=keep, log=log, cancel=cancel,
+                progress=lambda f, t: state.__setitem__("progress", (f, t)))
+
+        def success(s):
+            show_success(
+                "download",
+                f"{human(s['original'])}  \u2192  {human(s['packed'])}   "
+                f"({s['saved']:.1f}% smaller)",
+                f"Downloaded {s['files']} file(s) and saved them compressed and verified"
+                + (", plus the uncompressed copies." if keep else "."),
+                os.path.dirname(os.path.abspath(s["output"])),
+            )
+
+        start_job("download", work, success)
+
+    d_button.configure(command=on_download_click)
+
     def poll():
         while True:
             try:
@@ -839,8 +1122,11 @@ def run_gui():
         busy, prog = state["busy"], state["progress"]
         if busy and prog:
             _, bar, status, *_ = widgets[busy]
-            bar.configure(value=int(prog[0] * 1000))
-            status.configure(text=f"{prog[1]}  {prog[0] * 100:.0f}%")
+            if prog[0] is None:  # size unknown: just show the text
+                status.configure(text=prog[1])
+            else:
+                bar.configure(value=int(prog[0] * 1000))
+                status.configure(text=f"{prog[1]}  {prog[0] * 100:.0f}%")
         root.after(80, poll)
 
     def on_close():
@@ -869,7 +1155,7 @@ def run_gui():
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if not argv or argv[0] not in ("compress", "extract", "list", "-h", "--help"):
+    if not argv or argv[0] not in ("compress", "extract", "download", "list", "-h", "--help"):
         try:
             run_gui()
             return 0
@@ -887,6 +1173,12 @@ def main(argv=None):
     x = sub.add_parser("extract", help="unpack an archive")
     x.add_argument("archive")
     x.add_argument("dest", nargs="?", help="destination folder (default: next to archive)")
+    d = sub.add_parser("download", help="download links (Google Drive, Dropbox, ...) "
+                       "and save them compressed")
+    d.add_argument("output", help="archive to create (.tar.xz is added if missing)")
+    d.add_argument("urls", nargs="+", help="share links or direct download links")
+    d.add_argument("--level", choices=list(LEVELS), default="best")
+    d.add_argument("--keep", action="store_true", help="also keep the uncompressed downloads")
     l = sub.add_parser("list", help="show what is inside an archive")
     l.add_argument("archive")
     args = parser.parse_args(argv)
@@ -896,6 +1188,9 @@ def main(argv=None):
             compress(args.output, args.inputs, level=args.level)
         elif args.cmd == "extract":
             extract(args.archive, args.dest)
+        elif args.cmd == "download":
+            download_and_compress(args.urls, args.output, level=args.level,
+                                  keep_originals=args.keep)
         else:
             list_archive(args.archive)
     except Exception as e:

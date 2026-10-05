@@ -21,6 +21,19 @@ You need Python 3.8 or newer (get it from [python.org](https://www.python.org/do
 2. Choose where to put the files (**Extract to**), then click **Extract**.
 3. It checks every restored file and confirms that nothing was lost.
 
+**Download tab**
+1. Paste one or more links, one per line (the **Paste link** button pastes from your clipboard).
+2. Click **Download & Compress**. It downloads each file to your computer and saves them all in one compressed, verified archive (in your Downloads folder unless you pick another place).
+3. Tick **Also keep the uncompressed files** if you want the normal files as well.
+
+Links that work:
+- **Google Drive files** shared as "Anyone with the link" (large files too)
+- **Google Docs, Sheets and Slides**, saved as Word, Excel and PowerPoint files
+- **Dropbox** share links
+- Any **direct download link**
+
+Not supported: private files that need you to log in, and Google Drive *folder* links. For a folder, open it in Drive, select everything and click Download; Drive gives you a ZIP. Also, the file is downloaded at full size first and then compressed, so this saves space on your disk, not download time or data.
+
 The **Details** tab lists every step if you want to see exactly what happened.
 
 Optional: run `pip install tkinterdnd2` to also drag and drop files onto the window.
@@ -30,6 +43,7 @@ Optional: run `pip install tkinterdnd2` to also drag and drop files onto the win
 ```
 python lossless_compressor.py compress MyStuff.tar.xz photo.png "My Folder" notes.txt
 python lossless_compressor.py compress MyStuff.tar.xz "My Folder" --level fast
+python lossless_compressor.py download MyDownloads.tar.xz "https://drive.google.com/file/d/.../view" --keep
 python lossless_compressor.py list     MyStuff.tar.xz
 python lossless_compressor.py extract  MyStuff.tar.xz  RestoredFolder
 ```
