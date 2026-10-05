@@ -43,10 +43,28 @@ Optional: run `pip install tkinterdnd2` to also drag and drop files onto the win
 ```
 python core_compressor.py compress MyStuff.tar.xz photo.png "My Folder" notes.txt
 python core_compressor.py compress MyStuff.tar.xz "My Folder" --level fast --threads 4
+python core_compressor.py compress Sorted.tar.xz "Camera Dump" --sort type-date
 python core_compressor.py download MyDownloads.tar.xz "https://drive.google.com/file/d/.../view" --keep
 python core_compressor.py list     MyStuff.tar.xz
 python core_compressor.py extract  MyStuff.tar.xz  RestoredFolder
 ```
+
+## Sorting files into folders
+
+The **Sort files** setting (Compress and Download tabs) arranges the files into folders inside the archive, so they come out sorted when you extract it. Your original files are never moved or changed.
+
+| Setting | Example of where a file ends up |
+|---|---|
+| Keep folders as they are | `Camera Dump/sub/clip.mp4` (unchanged) |
+| By type | `Videos/clip.mp4`, `Photos/IMG_1234.jpg`, `RAW photos/DSC_0042.NEF` |
+| By date taken | `2023/07 July/clip.mp4` |
+| By type, then date | `Videos/2023/07 July/clip.mp4` |
+| By name | `IMG/IMG_1234.jpg`, `Vacation/Vacation 02.mov` |
+| By type, then name | `Photos/IMG/IMG_1234.jpg` |
+
+Types: Videos, Photos, RAW photos, Audio, Documents, Archives and Other.
+
+The date is the date the photo or video was **taken**. It is read from inside the file: EXIF in JPEG, TIFF and most RAW files (CR2, NEF, ARW, DNG, ORF, PEF...), and the recording date in MP4/MOV videos. If a file has no date inside (for example PNG, HEIC or CR3), the file's own modified date is used. Downloaded files keep the "last changed" date from Google Drive or the website when the server provides it, not the download date. Two files that would end up with the same name are kept as `name.jpg` and `name (2).jpg`.
 
 ## Speed settings
 

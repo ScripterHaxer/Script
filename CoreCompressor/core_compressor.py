@@ -260,6 +260,195 @@ def _is_regular(path):
     return os.path.isfile(path) and not os.path.islink(path)
 
 
+# ----------------------------------------------------------------------------- sorting
+
+SORT_MODES = {
+    "none": "Keep folders as they are",
+    "type": "By type (Videos, Photos, RAW...)",
+    "date": "By date taken (year / month)",
+    "type-date": "By type, then date",
+    "name": "By name (IMG_..., Vacation...)",
+    "type-name": "By type, then name",
+}
+FILE_TYPES = {
+    "Videos": "mp4 mov m4v avi mkv wmv flv webm mts m2ts 3gp mpg mpeg vob",
+    "Photos": "jpg jpeg png gif bmp tif tiff webp heic heif avif",
+    "RAW photos": "cr2 cr3 crw nef nrw arw srf sr2 dng orf rw2 raf pef srw raw rwl 3fr "
+                  "erf kdc mos mrw x3f iiq",
+    "Audio": "mp3 wav flac aac m4a ogg wma opus aiff aif",
+    "Documents": "pdf doc docx xls xlsx ppt pptx txt rtf odt ods odp csv md epub",
+    "Archives": "zip rar 7z tar gz xz bz2 iso",
+}
+TYPE_OF = {ext: kind for kind, exts in FILE_TYPES.items() for ext in exts.split()}
+MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August",
+          "September", "October", "November", "December"]
+_TIFF_BASED = {"jpg", "jpeg", "tif", "tiff", "cr2", "nef", "nrw", "arw", "srf", "sr2",
+               "dng", "orf", "pef", "srw", "rw2", "3fr", "erf", "kdc", "mos", "iiq"}
+_ISO_BMFF = {"mp4", "mov", "m4v", "3gp", "heic", "heif", "avif", "cr3"}
+
+
+def file_type(path):
+    return TYPE_OF.get(os.path.splitext(path)[1].lower().lstrip("."), "Other")
+
+
+def _plausible(ts):
+    return 315532800 <= ts <= time.time() + 86400 * 366  # 1980 .. next year
+
+
+def _exif_date(path):
+    """DateTimeOriginal from a JPEG or a TIFF-based RAW file, as a timestamp."""
+    with open(path, "rb") as f:
+        head = f.read(256 * 1024)
+    if head[:2] == b"\xff\xd8":  # JPEG: find the APP1 "Exif" segment
+        i = 2
+        while i + 4 <= len(head) and head[i] == 0xFF:
+            marker, size = head[i + 1], struct.unpack(">H", head[i + 2:i + 4])[0]
+            if marker == 0xE1 and head[i + 4:i + 10] == b"Exif\x00\x00":
+                head = head[i + 10:i + 2 + size]
+                break
+            i += 2 + size
+        else:
+            return None
+    if head[:4] not in (b"II*\x00", b"MM\x00*", b"IIRO", b"IIU\x00"):  # TIFF (+ ORF, RW2)
+        return None
+    e = "<" if head[:2] == b"II" else ">"
+
+    def entries(offset):
+        if offset + 2 > len(head):
+            return {}
+        count = struct.unpack(e + "H", head[offset:offset + 2])[0]
+        out = {}
+        for k in range(count):
+            at = offset + 2 + 12 * k
+            if at + 12 > len(head):
+                break
+            tag, kind, n = struct.unpack(e + "HHI", head[at:at + 8])
+            value = head[at + 8:at + 12]
+            out[tag] = (kind, n, value)
+        return out
+
+    def read_text(entry):
+        kind, n, value = entry
+        if kind != 2:
+            return None
+        if n <= 4:
+            raw = value[:n]
+        else:
+            off = struct.unpack(e + "I", value)[0]
+            raw = head[off:off + n]
+        return raw.split(b"\x00")[0].decode("ascii", "ignore")
+
+    ifd0 = entries(struct.unpack(e + "I", head[4:8])[0])
+    candidates = []
+    if 0x8769 in ifd0:  # Exif sub-IFD
+        exif = entries(struct.unpack(e + "I", ifd0[0x8769][2])[0])
+        candidates += [exif.get(0x9003), exif.get(0x9004)]
+    candidates.append(ifd0.get(0x0132))
+    for entry in candidates:
+        text = entry and read_text(entry)
+        if text:
+            try:
+                ts = time.mktime(time.strptime(text.strip()[:19], "%Y:%m:%d %H:%M:%S"))
+            except (ValueError, OverflowError):
+                continue
+            if _plausible(ts):
+                return ts
+    return None
+
+
+def _mp4_date(path):
+    """Recording date stored in an MP4/MOV file (moov/mvhd creation time)."""
+    with open(path, "rb") as f:
+        end = os.fstat(f.fileno()).st_size
+
+        def boxes(start, stop):
+            pos = start
+            while pos + 8 <= stop:
+                f.seek(pos)
+                size, kind = struct.unpack(">I4s", f.read(8))
+                header = 8
+                if size == 1:
+                    size = struct.unpack(">Q", f.read(8))[0]
+                    header = 16
+                elif size == 0:
+                    size = stop - pos
+                if size < header:
+                    return
+                yield kind, pos + header, pos + size
+                pos += size
+
+        for kind, body, stop in boxes(0, end):
+            if kind == b"moov":
+                for sub, sbody, _ in boxes(body, stop):
+                    if sub == b"mvhd":
+                        f.seek(sbody)
+                        version = f.read(4)[0]
+                        raw = f.read(8 if version == 1 else 4)
+                        secs = int.from_bytes(raw, "big") - 2082844800  # 1904 -> 1970
+                        return secs if _plausible(secs) else None
+    return None
+
+
+def date_taken(path):
+    """Best guess of when a photo or video was taken; falls back to the file date."""
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    try:
+        if ext in _TIFF_BASED:
+            ts = _exif_date(path)
+            if ts:
+                return ts
+        if ext in _ISO_BMFF:
+            ts = _mp4_date(path)
+            if ts:
+                return ts
+    except (OSError, struct.error, IndexError, ValueError):
+        pass
+    return os.path.getmtime(path)
+
+
+def name_group(filename):
+    """'IMG_1234.jpg' -> 'IMG', 'Vacation 2 (3).mp4' -> 'Vacation'."""
+    stem = os.path.splitext(filename)[0]
+    group = re.sub(r"[\s_\-.()\[\]]*\d[\d\s_\-.()\[\]]*$", "", stem).strip(" _-.")
+    group = re.sub(r'[\\/:*?"<>|]', "_", group)
+    return group or "Other"
+
+
+def sorted_folder(path, mode):
+    parts = []
+    if mode.startswith("type"):
+        parts.append(file_type(path))
+    if mode.endswith("date"):
+        t = time.localtime(date_taken(path))
+        parts += [str(t.tm_year), f"{t.tm_mon:02d} {MONTHS[t.tm_mon - 1]}"]
+    elif mode.endswith("name"):
+        parts.append(name_group(os.path.basename(path)))
+    return "/".join(parts)
+
+
+def sort_entries(entries, mode, log=print):
+    """Give every file a new place inside the archive, based on the sort mode.
+    Folders themselves are not stored; they are recreated from the new paths."""
+    if mode == "none":
+        return entries
+    out, used = [], set()
+    for src, arcname in entries:
+        if os.path.isdir(src) and not os.path.islink(src):
+            continue
+        folder = sorted_folder(src, mode)
+        name = os.path.basename(arcname)
+        target = f"{folder}/{name}" if folder else name
+        stem, ext = os.path.splitext(name)
+        i = 2
+        while target.lower() in used:
+            target = f"{folder}/{stem} ({i}){ext}" if folder else f"{stem} ({i}){ext}"
+            i += 1
+        used.add(target.lower())
+        out.append((src, target))
+    log(f"Sorted {len(out)} file(s) into folders: {SORT_MODES[mode]}.")
+    return sorted(out, key=lambda e: e[1].lower())
+
+
 def _add_entries(tar, entries, manifest, log, on_read, cancel):
     for src, arcname in entries:
         if cancel is not None and cancel.is_set():
@@ -284,7 +473,7 @@ def _add_entries(tar, entries, manifest, log, on_read, cancel):
 
 
 def compress(output, inputs, level="best", log=print, progress=_noop, cancel=None,
-             threads=CPU_COUNT):
+             threads=CPU_COUNT, sort="none"):
     """Create an archive. progress(fraction, text) is called as work proceeds.
     threads = how many CPU cores compress at the same time."""
     if not output.endswith(EXTENSION):
@@ -293,6 +482,7 @@ def compress(output, inputs, level="best", log=print, progress=_noop, cancel=Non
     part = output + ".part"
     skip = {out_abs, os.path.abspath(part)}
     entries = [e for e in collect(inputs) if os.path.abspath(e[0]) not in skip]
+    entries = sort_entries(entries, sort, log)
     total = sum(os.path.getsize(src) for src, _ in entries if _is_regular(src)) or 1
 
     manifest = {"format": 1, "created": time.time(), "files": {}}
@@ -605,6 +795,14 @@ def download(url, folder, log=print, progress=_noop, cancel=None, connections=1)
                 'probably private: share it as "Anyone with the link" and try again.'
             )
         name = _filename_from_response(resp, direct)
+        modified = None
+        if resp.headers.get("Last-Modified"):
+            try:
+                from email.utils import parsedate_to_datetime
+
+                modified = parsedate_to_datetime(resp.headers["Last-Modified"]).timestamp()
+            except (TypeError, ValueError):
+                pass
         total = int(resp.headers.get("Content-Length") or 0)
         split = (connections > 1 and total >= SPLIT_MIN
                  and resp.headers.get("Accept-Ranges", "").lower() == "bytes")
@@ -664,13 +862,15 @@ def download(url, folder, log=print, progress=_noop, cancel=None, connections=1)
     if total and done < total:
         os.remove(path)
         raise RuntimeError(f"Download of {name} was cut off ({human(done)} of {human(total)}).")
+    if modified:  # keep the file's own date (used when sorting by date)
+        os.utime(path, (modified, modified))
     log(f"  downloaded {name} ({human(done)})")
     return path
 
 
 def download_and_compress(urls, output, level="best", keep_originals=False, log=print,
                           progress=_noop, cancel=None, threads=CPU_COUNT,
-                          parallel=1, connections=1):
+                          parallel=1, connections=1, sort="none"):
     """Download every link (`parallel` at a time), then pack them all into one verified
     archive using `threads` CPU cores."""
     urls = [u.strip() for u in urls if u.strip()]
@@ -710,6 +910,7 @@ def download_and_compress(urls, output, level="best", keep_originals=False, log=
 
         log(f"Compressing {len(files)} downloaded file(s)...")
         stats = compress(output, files, level=level, log=log, cancel=cancel, threads=threads,
+                         sort=sort,
                          progress=lambda f, t: progress(0.5 + 0.5 * f, t))
         if keep_originals:
             for f in files:
@@ -999,6 +1200,19 @@ def run_gui():
         ttk.Combobox(parent, textvariable=cores_var, values=list(core_names),
                      state="readonly", width=22).pack(side="left")
 
+    sort_names = {label: key for key, label in SORT_MODES.items()}
+    sort_var = tk.StringVar(value=SORT_MODES["none"])  # shared by both tabs
+
+    def sort_row(parent):
+        row = ttk.Frame(parent)
+        ttk.Label(row, text="Sort files:", width=12).pack(side="left")
+        ttk.Combobox(row, textvariable=sort_var, values=list(sort_names),
+                     state="readonly", width=34).pack(side="left")
+        ttk.Label(row, text="Your original files are not moved.",
+                  style="Hint.TLabel").pack(side="left", padx=12)
+        return row
+
+    c_sort_row = sort_row(ctab)
     level_row = ttk.Frame(ctab)
     ttk.Label(level_row, text="Compression:", width=12).pack(side="left")
     ttk.Combobox(
@@ -1030,6 +1244,7 @@ def run_gui():
     c_status.pack(side="bottom", fill="x", pady=(4, 0))
     c_action.pack(side="bottom", fill="x", pady=(12, 0))
     out_row.pack(side="bottom", fill="x", pady=(8, 0))
+    c_sort_row.pack(side="bottom", fill="x", pady=(8, 0))
     level_row.pack(side="bottom", fill="x", pady=(10, 0))
     buttons.pack(side="bottom", fill="x")
     tree_frame.pack(fill="both", expand=True, pady=(8, 6))
@@ -1077,7 +1292,7 @@ def run_gui():
             def show():
                 if arc_var.get() != path:
                     return
-                for name, is_dir, nbytes in rows:
+                for name, is_dir, nbytes in sorted(rows, key=lambda r: r[0].lower()):
                     xtree.insert("", "end", values=(name + ("/" if is_dir else ""),
                                                     "" if is_dir else human(nbytes)))
                 total = sum(r[2] for r in rows)
@@ -1178,6 +1393,7 @@ def run_gui():
     d_status.pack(side="bottom", fill="x", pady=(4, 0))
     d_action.pack(side="bottom", fill="x", pady=(12, 0))
     d_out_row.pack(side="bottom", fill="x", pady=(8, 0))
+    sort_row(dtab).pack(side="bottom", fill="x", pady=(8, 0))
     d_speed_row.pack(side="bottom", fill="x", pady=(8, 0))
     d_level_row.pack(side="bottom", fill="x", pady=(10, 0))
     link_buttons.pack(side="bottom", fill="x", pady=(6, 0))
@@ -1262,10 +1478,12 @@ def run_gui():
             return
         paths = list(items.values())
         level, threads = level_names[level_var.get()], core_names[cores_var.get()]
+        sort = sort_names[sort_var.get()]
         log(f"Compressing {len(paths)} item(s) into {out}")
 
         def work(cancel):
-            return compress(out, paths, level=level, threads=threads, log=log, cancel=cancel,
+            return compress(out, paths, level=level, threads=threads, sort=sort,
+                            log=log, cancel=cancel,
                             progress=lambda f, t: state.__setitem__("progress", (f, t)))
 
         def success(s):
@@ -1329,14 +1547,14 @@ def run_gui():
         ):
             return
         level, keep = level_names[d_level_var.get()], keep_var.get()
-        threads = core_names[cores_var.get()]
+        threads, sort = core_names[cores_var.get()], sort_names[sort_var.get()]
         parallel, connections = (3, 4) if fast_dl_var.get() else (1, 1)
         log(f"Downloading {len(urls)} link(s) into {out}")
 
         def work(cancel):
             return download_and_compress(
                 urls, out, level=level, keep_originals=keep, log=log, cancel=cancel,
-                threads=threads, parallel=parallel, connections=connections,
+                threads=threads, parallel=parallel, connections=connections, sort=sort,
                 progress=lambda f, t: state.__setitem__("progress", (f, t)))
 
         def success(s):
@@ -1412,6 +1630,8 @@ def main(argv=None):
                    help="best = smallest (default), fast = quickest")
     c.add_argument("--threads", type=int, default=CPU_COUNT,
                    help=f"CPU cores to use (default: all {CPU_COUNT})")
+    c.add_argument("--sort", choices=list(SORT_MODES), default="none",
+                   help="sort files into folders inside the archive")
     x = sub.add_parser("extract", help="unpack an archive")
     x.add_argument("archive")
     x.add_argument("dest", nargs="?", help="destination folder (default: next to archive)")
@@ -1422,6 +1642,8 @@ def main(argv=None):
     d.add_argument("--level", choices=list(LEVELS), default="best")
     d.add_argument("--keep", action="store_true", help="also keep the uncompressed downloads")
     d.add_argument("--threads", type=int, default=CPU_COUNT, help="CPU cores to use")
+    d.add_argument("--sort", choices=list(SORT_MODES), default="none",
+                   help="sort files into folders inside the archive")
     d.add_argument("--parallel", type=int, default=3, help="files downloaded at once (3)")
     d.add_argument("--connections", type=int, default=4,
                    help="connections per big file (4); use 1 if a site complains")
@@ -1431,13 +1653,15 @@ def main(argv=None):
 
     try:
         if args.cmd == "compress":
-            compress(args.output, args.inputs, level=args.level, threads=args.threads)
+            compress(args.output, args.inputs, level=args.level, threads=args.threads,
+                     sort=args.sort)
         elif args.cmd == "extract":
             extract(args.archive, args.dest)
         elif args.cmd == "download":
             download_and_compress(args.urls, args.output, level=args.level,
                                   keep_originals=args.keep, threads=args.threads,
-                                  parallel=args.parallel, connections=args.connections)
+                                  parallel=args.parallel, connections=args.connections,
+                                  sort=args.sort)
         else:
             list_archive(args.archive)
     except Exception as e:
