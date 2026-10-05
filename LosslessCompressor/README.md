@@ -2,23 +2,34 @@
 
 Packs files and folders into one smaller archive. When you extract it, every file comes back **byte-for-byte identical** to the original, so images keep every pixel and documents keep every detail.
 
+![The Lossless Compressor window](screenshot.png)
+
 ## How to use
 
-You need Python 3.8 or newer. Nothing else has to be installed.
+You need Python 3.8 or newer (get it from [python.org](https://www.python.org/downloads/)). Nothing else has to be installed.
 
-**With the window (easiest):** double-click `lossless_compressor.py`, or run:
+**Open the window:** double-click **`Lossless Compressor.pyw`**. On Windows this opens without a black terminal window. On Mac or Linux, run `python3 lossless_compressor.py` instead.
 
-```
-python lossless_compressor.py
-```
+**Compress tab**
+1. Click **+ Add files** or **+ Add folder**. Add as many as you like; the list shows their sizes.
+2. Pick a compression level. **Best** gives the smallest file; **Fast** is quicker but bigger.
+3. Check where it will be saved (**Save as**), then click **Compress**.
+4. A progress bar shows how far along it is, and you can **Cancel** at any time. When it finishes you see how much smaller it got, and **Open folder** takes you to the archive.
 
-Click **Add files...** or **Add folder...**, then **Compress**, and choose where to save the archive.
-To get your files back, click **Extract archive...**.
+**Extract tab**
+1. Click **Browse...** next to **Archive** and pick a `.tar.xz` file. The list shows what's inside.
+2. Choose where to put the files (**Extract to**), then click **Extract**.
+3. It checks every restored file and confirms that nothing was lost.
+
+The **Details** tab lists every step if you want to see exactly what happened.
+
+Optional: run `pip install tkinterdnd2` to also drag and drop files onto the window.
 
 **From the command line:**
 
 ```
 python lossless_compressor.py compress MyStuff.tar.xz photo.png "My Folder" notes.txt
+python lossless_compressor.py compress MyStuff.tar.xz "My Folder" --level fast
 python lossless_compressor.py list     MyStuff.tar.xz
 python lossless_compressor.py extract  MyStuff.tar.xz  RestoredFolder
 ```

@@ -4,7 +4,7 @@ Lossless Compressor - pack files and folders into one smaller archive and
 unpack them later bit-for-bit identical (no lost pixels, quality or detail).
 
 How it works
-  * Everything is stored in a standard .tar.xz archive (LZMA, max preset).
+  * Everything is stored in a standard .tar.xz archive (LZMA compression).
     LZMA is a *lossless* algorithm: decompression restores the exact bytes.
   * Every file's SHA-256 hash is saved inside the archive. After compressing,
     the archive is re-read and checked against the originals, and the same
@@ -17,7 +17,8 @@ Usage
   python lossless_compressor.py extract ARCHIVE.tar.xz [DEST_FOLDER]
   python lossless_compressor.py list ARCHIVE.tar.xz
 
-Only the Python standard library is used (Python 3.8+).
+Only the Python standard library is used (Python 3.8+). If the optional
+package "tkinterdnd2" is installed, you can drag files onto the window.
 """
 
 import argparse
@@ -33,7 +34,21 @@ import time
 MANIFEST_NAME = ".lossless_manifest.json"
 EXTENSION = ".tar.xz"
 CHUNK = 1024 * 1024
-XZ_PRESET = 9 | lzma.PRESET_EXTREME
+LEVELS = {
+    "best": 9 | lzma.PRESET_EXTREME,  # smallest archive, slowest
+    "normal": 6,
+    "fast": 1,
+}
+# Extraction filter (Python 3.11.4+). Paths are also checked by _check_safe.
+EXTRACT_KW = {"filter": "tar"} if hasattr(tarfile, "tar_filter") else {}
+
+
+class Cancelled(Exception):
+    pass
+
+
+def _noop(*_args):
+    pass
 
 
 def human(n):
@@ -43,16 +58,48 @@ def human(n):
         n /= 1024
 
 
-def sha256_stream(fileobj):
+class _Reader:
+    """File wrapper that counts bytes, optionally hashes them, and can cancel."""
+
+    def __init__(self, f, on_read=_noop, cancel=None, hasher=None):
+        self.f, self.on_read, self.cancel, self.hasher = f, on_read, cancel, hasher
+        self.pos = 0
+
+    def read(self, n=-1):
+        if self.cancel is not None and self.cancel.is_set():
+            raise Cancelled()
+        data = self.f.read(n)
+        if self.hasher is not None:
+            self.hasher.update(data)
+        self.pos += len(data)
+        self.on_read(len(data))
+        return data
+
+    def seek(self, *args):
+        self.pos = self.f.seek(*args)
+        return self.pos
+
+    def tell(self):
+        return self.f.tell()
+
+    def seekable(self):
+        return True
+
+    def readable(self):
+        return True
+
+
+def sha256_stream(fileobj, cancel=None, on_read=_noop):
     h = hashlib.sha256()
-    for block in iter(lambda: fileobj.read(CHUNK), b""):
-        h.update(block)
+    reader = _Reader(fileobj, on_read, cancel, h)
+    while reader.read(CHUNK):
+        pass
     return h.hexdigest()
 
 
-def sha256_file(path):
+def sha256_file(path, cancel=None, on_read=_noop):
     with open(path, "rb") as f:
-        return sha256_stream(f)
+        return sha256_stream(f, cancel, on_read)
 
 
 def collect(inputs):
@@ -61,7 +108,7 @@ def collect(inputs):
     seen = set()
     for raw in inputs:
         src = os.path.abspath(raw)
-        if not os.path.exists(src):
+        if not os.path.lexists(src):
             raise FileNotFoundError(f"Not found: {raw}")
         base = os.path.basename(src.rstrip(os.sep)) or "root"
         name = base
@@ -76,11 +123,9 @@ def collect(inputs):
                 dirs.sort()
                 rel_root = os.path.relpath(root, src)
                 for d in dirs:
-                    p = os.path.join(root, d)
-                    entries.append((p, _arc(name, rel_root, d)))
+                    entries.append((os.path.join(root, d), _arc(name, rel_root, d)))
                 for f in sorted(files):
-                    p = os.path.join(root, f)
-                    entries.append((p, _arc(name, rel_root, f)))
+                    entries.append((os.path.join(root, f), _arc(name, rel_root, f)))
     return entries
 
 
@@ -89,245 +134,734 @@ def _arc(top, rel_root, leaf):
     return "/".join(parts)
 
 
-def compress(output, inputs, log=print):
+def _is_regular(path):
+    return os.path.isfile(path) and not os.path.islink(path)
+
+
+def compress(output, inputs, level="best", log=print, progress=_noop, cancel=None):
+    """Create an archive. progress(fraction, text) is called as work proceeds."""
     if not output.endswith(EXTENSION):
         output += EXTENSION
     out_abs = os.path.abspath(output)
-    entries = [e for e in collect(inputs) if os.path.abspath(e[0]) != out_abs]
+    part = output + ".part"
+    skip = {out_abs, os.path.abspath(part)}
+    entries = [e for e in collect(inputs) if os.path.abspath(e[0]) not in skip]
+    total = sum(os.path.getsize(src) for src, _ in entries if _is_regular(src)) or 1
 
     manifest = {"format": 1, "created": time.time(), "files": {}}
     original_size = 0
     start = time.time()
+    done = 0
 
-    with tarfile.open(output, "w:xz", preset=XZ_PRESET) as tar:
-        for src, arcname in entries:
-            info = tar.gettarinfo(src, arcname)
-            if info is None:  # sockets, devices, etc.
-                log(f"  skipped (unsupported type): {src}")
-                continue
-            if info.isreg():
-                digest = sha256_file(src)
-                manifest["files"][arcname] = {"sha256": digest, "size": info.size}
-                original_size += info.size
-                with open(src, "rb") as f:
-                    tar.addfile(info, f)
-                log(f"  added {arcname} ({human(info.size)})")
-            else:
-                tar.addfile(info)
-        data = json.dumps(manifest, indent=1).encode("utf-8")
-        minfo = tarfile.TarInfo(MANIFEST_NAME)
-        minfo.size = len(data)
-        minfo.mtime = int(time.time())
-        tar.addfile(minfo, io.BytesIO(data))
+    def on_read(n):
+        nonlocal done
+        done += n
+        progress(0.85 * done / total, f"Compressing... {human(done)} of {human(total)}")
 
-    log("Verifying archive against the original files...")
-    problems = verify(output)
-    if problems:
-        raise RuntimeError("Verification FAILED:\n  " + "\n  ".join(problems))
+    try:
+        with tarfile.open(part, "w:xz", preset=LEVELS[level]) as tar:
+            for src, arcname in entries:
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled()
+                info = tar.gettarinfo(src, arcname)
+                if info is None:  # sockets, devices, etc.
+                    log(f"  skipped (unsupported type): {src}")
+                    continue
+                if info.isreg():
+                    h = hashlib.sha256()
+                    with open(src, "rb") as f:
+                        tar.addfile(info, _Reader(f, on_read, cancel, h))
+                    manifest["files"][arcname] = {"sha256": h.hexdigest(), "size": info.size}
+                    original_size += info.size
+                    log(f"  added {arcname} ({human(info.size)})")
+                else:
+                    tar.addfile(info)
+            data = json.dumps(manifest, indent=1).encode("utf-8")
+            minfo = tarfile.TarInfo(MANIFEST_NAME)
+            minfo.size = len(data)
+            minfo.mtime = int(time.time())
+            tar.addfile(minfo, io.BytesIO(data))
+
+        log("Verifying archive against the original files...")
+        problems = verify(part, progress=progress, cancel=cancel, base=0.85, span=0.15)
+        if problems:
+            raise RuntimeError("Verification FAILED:\n  " + "\n  ".join(problems))
+        os.replace(part, output)
+    except BaseException:
+        if os.path.exists(part):
+            os.remove(part)
+        raise
 
     packed = os.path.getsize(output)
-    saved = (1 - packed / original_size) * 100 if original_size else 0.0
+    stats = {
+        "output": output,
+        "files": len(manifest["files"]),
+        "original": original_size,
+        "packed": packed,
+        "saved": (1 - packed / original_size) * 100 if original_size else 0.0,
+        "seconds": time.time() - start,
+    }
+    progress(1.0, "Done")
     log(
-        f"Done in {time.time() - start:.1f}s: {len(manifest['files'])} files, "
-        f"{human(original_size)} -> {human(packed)} ({saved:.1f}% smaller). "
+        f"Done in {stats['seconds']:.1f}s: {stats['files']} files, "
+        f"{human(original_size)} -> {human(packed)} ({stats['saved']:.1f}% smaller). "
         f"Verified lossless."
     )
-    return output
+    return stats
 
 
-def read_manifest(tar):
-    try:
-        member = tar.getmember(MANIFEST_NAME)
-    except KeyError:
-        return None
+def _open_archive(f, archive, on_progress, cancel):
+    size = os.path.getsize(archive) or 1
+    raw = _Reader(f, lambda n: on_progress(raw.pos / size), cancel)
+    return tarfile.open(fileobj=raw, mode="r:xz")
+
+
+def _load_manifest(tar, member):
     return json.loads(tar.extractfile(member).read().decode("utf-8"))
 
 
-def verify(archive):
+def verify(archive, progress=_noop, cancel=None, base=0.0, span=1.0):
     """Check every file stored in the archive against its saved SHA-256."""
-    problems = []
-    with tarfile.open(archive, "r:xz") as tar:
-        manifest = read_manifest(tar)
-        if manifest is None:
-            return ["archive has no manifest (not made by this tool?)"]
-        expected = dict(manifest["files"])
+    hashes = {}
+    manifest = None
+    report = lambda frac: progress(base + span * frac, "Verifying...")
+    with open(archive, "rb") as f, _open_archive(f, archive, report, cancel) as tar:
         for member in tar:
-            if member.isreg() and member.name in expected:
-                digest = sha256_stream(tar.extractfile(member))
-                if digest != expected.pop(member.name)["sha256"]:
-                    problems.append(f"content differs: {member.name}")
-        problems += [f"missing from archive: {n}" for n in expected]
+            if member.name == MANIFEST_NAME:
+                manifest = _load_manifest(tar, member)
+            elif member.isreg():
+                hashes[member.name] = sha256_stream(tar.extractfile(member), cancel)
+    if manifest is None:
+        return ["archive has no manifest (not made by this tool?)"]
+    problems = []
+    for name, meta in manifest["files"].items():
+        if name not in hashes:
+            problems.append(f"missing from archive: {name}")
+        elif hashes[name] != meta["sha256"]:
+            problems.append(f"content differs: {name}")
     return problems
 
 
-def _safe_members(tar, dest):
+def _check_safe(m, dest):
     """Refuse entries that would write outside the destination folder."""
-    dest = os.path.realpath(dest)
-    for m in tar.getmembers():
-        if m.name == MANIFEST_NAME:
-            continue
-        target = os.path.realpath(os.path.join(dest, m.name))
-        if os.path.commonpath([dest, target]) != dest:
-            raise RuntimeError(f"Unsafe path in archive, refusing: {m.name}")
-        if m.issym() or m.islnk():
-            link = os.path.realpath(os.path.join(os.path.dirname(target), m.linkname))
-            if os.path.commonpath([dest, link]) != dest:
-                raise RuntimeError(f"Unsafe link in archive, refusing: {m.name}")
-        if m.isdev():
-            continue
-        yield m
+    target = os.path.realpath(os.path.join(dest, m.name))
+    if os.path.commonpath([dest, target]) != dest:
+        raise RuntimeError(f"Unsafe path in archive, refusing: {m.name}")
+    if m.issym() or m.islnk():
+        base = os.path.dirname(target) if m.issym() else dest
+        link = os.path.realpath(os.path.join(base, m.linkname))
+        if os.path.commonpath([dest, link]) != dest:
+            raise RuntimeError(f"Unsafe link in archive, refusing: {m.name}")
 
 
-def extract(archive, dest=None, log=print):
-    if dest is None:
-        name = os.path.basename(archive)
-        if name.endswith(EXTENSION):
-            name = name[: -len(EXTENSION)]
-        dest = os.path.join(os.path.dirname(os.path.abspath(archive)), name)
+def default_extract_dir(archive):
+    name = os.path.basename(archive)
+    if name.endswith(EXTENSION):
+        name = name[: -len(EXTENSION)]
+    return os.path.join(os.path.dirname(os.path.abspath(archive)), name)
+
+
+def extract(archive, dest=None, log=print, progress=_noop, cancel=None):
+    """Unpack an archive and verify every restored file."""
+    dest = dest or default_extract_dir(archive)
     os.makedirs(dest, exist_ok=True)
+    dest_real = os.path.realpath(dest)
     start = time.time()
+    manifest = None
+    dirs = []
 
-    with tarfile.open(archive, "r:xz") as tar:
-        manifest = read_manifest(tar)
-        members = list(_safe_members(tar, dest))
-        for m in members:
+    report = lambda frac: progress(0.8 * frac, "Extracting...")
+    with open(archive, "rb") as f, _open_archive(f, archive, report, cancel) as tar:
+        for m in tar:
+            if m.name == MANIFEST_NAME:
+                manifest = _load_manifest(tar, m)
+                continue
+            _check_safe(m, dest_real)
+            if m.isdev():
+                continue
+            if m.isdir():
+                os.makedirs(os.path.join(dest, m.name), exist_ok=True)
+                dirs.append(m)
+                continue
             log(f"  extracting {m.name}")
-        kwargs = {"filter": "fully_trusted"} if hasattr(tarfile, "data_filter") else {}
-        tar.extractall(dest, members=members, **kwargs)
+            tar.extract(m, dest, **EXTRACT_KW)
+        # Folders last, so their dates are not changed by the files written into them.
+        tar.extractall(dest, members=dirs, **EXTRACT_KW)
 
     if manifest is None:
         log("No manifest found; extracted without verification.")
-        return dest
+        progress(1.0, "Done")
+        return {"dest": dest, "files": None, "original": None, "seconds": time.time() - start}
 
     log("Verifying extracted files...")
+    total = sum(meta["size"] for meta in manifest["files"].values()) or 1
+    done = 0
+
+    def on_read(n):
+        nonlocal done
+        done += n
+        progress(0.8 + 0.2 * done / total, "Verifying...")
+
     bad = []
     for arcname, meta in manifest["files"].items():
         path = os.path.join(dest, *arcname.split("/"))
-        if not os.path.isfile(path) or sha256_file(path) != meta["sha256"]:
+        if not os.path.isfile(path) or sha256_file(path, cancel, on_read) != meta["sha256"]:
             bad.append(arcname)
     if bad:
         raise RuntimeError("Extracted files do not match:\n  " + "\n  ".join(bad))
+    stats = {
+        "dest": dest,
+        "files": len(manifest["files"]),
+        "original": total if manifest["files"] else 0,
+        "seconds": time.time() - start,
+    }
+    progress(1.0, "Done")
     log(
-        f"Done in {time.time() - start:.1f}s: {len(manifest['files'])} files restored "
-        f"to {dest}. Every file is byte-for-byte identical to the original."
+        f"Done in {stats['seconds']:.1f}s: {stats['files']} files restored to {dest}. "
+        f"Every file is byte-for-byte identical to the original."
     )
-    return dest
+    return stats
+
+
+def contents(archive):
+    """Return [(name, is_dir, size)] for everything in the archive."""
+    with tarfile.open(archive, "r:xz") as tar:
+        return [
+            (m.name, m.isdir(), m.size if m.isreg() else 0)
+            for m in tar
+            if m.name != MANIFEST_NAME
+        ]
 
 
 def list_archive(archive, log=print):
-    with tarfile.open(archive, "r:xz") as tar:
-        total = 0
-        for m in tar:
-            if m.name == MANIFEST_NAME:
-                continue
-            kind = "dir " if m.isdir() else "file"
-            log(f"  {kind} {human(m.size) if m.isreg() else '':>10}  {m.name}")
-            total += m.size if m.isreg() else 0
-    packed = os.path.getsize(archive)
-    log(f"Original size {human(total)}, compressed {human(packed)}")
+    total = 0
+    for name, is_dir, size in contents(archive):
+        log(f"  {'dir ' if is_dir else 'file'} {'' if is_dir else human(size):>10}  {name}")
+        total += size
+    log(f"Original size {human(total)}, compressed {human(os.path.getsize(archive))}")
 
 
 # ----------------------------------------------------------------------------- GUI
 
+def open_in_file_manager(path):
+    import subprocess
+
+    if sys.platform == "win32":
+        os.startfile(path)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+
+
+def folder_size(path):
+    if not os.path.isdir(path) or os.path.islink(path):
+        return os.path.getsize(path), 1
+    size = count = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            p = os.path.join(root, f)
+            if _is_regular(p):
+                size += os.path.getsize(p)
+                count += 1
+    return size, count
+
+
 def run_gui():
+    import queue
     import threading
     import tkinter as tk
-    from tkinter import filedialog, messagebox, scrolledtext
+    from tkinter import filedialog, messagebox, scrolledtext, ttk
+    import tkinter.font as tkfont
 
-    root = tk.Tk()
+    if sys.platform == "win32":  # sharp text on high-DPI screens
+        try:
+            import ctypes
+
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+
+    try:  # optional drag and drop support
+        from tkinterdnd2 import DND_FILES, TkinterDnD
+
+        root = TkinterDnD.Tk()
+    except Exception:
+        DND_FILES = None
+        root = tk.Tk()
+
     root.title("Lossless Compressor")
-    root.geometry("720x520")
+    root.geometry("860x640")
+    root.minsize(680, 520)
 
-    items = []
+    style = ttk.Style(root)
+    if sys.platform == "win32":
+        style.theme_use("vista")
+    elif sys.platform != "darwin":
+        style.theme_use("clam")
 
-    top = tk.Frame(root, padx=10, pady=10)
-    top.pack(fill="both", expand=True)
+    base_font = tkfont.nametofont("TkDefaultFont")
+    family = base_font.actual("family")
+    size = max(base_font.actual("size"), 10)
+    GREEN, RED, GREY, ACCENT = "#1a7f37", "#cf222e", "#57606a", "#0969da"
+    style.configure("Title.TLabel", font=(family, size + 9, "bold"))
+    style.configure("Sub.TLabel", font=(family, size), foreground=GREY)
+    style.configure("Hint.TLabel", font=(family, size - 1), foreground=GREY)
+    style.configure("Big.TLabel", font=(family, size + 4, "bold"))
+    style.configure("Ok.TLabel", font=(family, size + 4, "bold"), foreground=GREEN)
+    style.configure("Err.TLabel", font=(family, size + 1, "bold"), foreground=RED)
+    style.configure("TNotebook.Tab", padding=(18, 6), font=(family, size + 1))
+    style.configure("Treeview", rowheight=int(size * 2.4))
+    style.configure("Accent.TButton", font=(family, size + 1, "bold"), padding=(18, 8))
+    if style.theme_use() == "clam":
+        style.configure("Horizontal.TProgressbar", background=ACCENT, troughcolor="#d0d7de")
+        style.map(
+            "Accent.TButton",
+            background=[("disabled", "#8c959f"), ("active", "#0550ae"), ("!active", ACCENT)],
+            foreground=[("!disabled", "white")],
+        )
 
-    tk.Label(top, text="Files and folders to compress:", anchor="w").pack(fill="x")
-    listbox = tk.Listbox(top, height=8, selectmode="extended")
-    listbox.pack(fill="both", expand=True, pady=(2, 6))
+    ui_queue = queue.Queue()
+    state = {"busy": None, "progress": None, "cancel": None}
+
+    def call_ui(fn):
+        ui_queue.put(fn)
+
+    def log(msg):
+        call_ui(lambda: _append_log(msg))
+
+    def _append_log(msg):
+        log_box.configure(state="normal")
+        log_box.insert("end", msg + "\n")
+        log_box.see("end")
+        log_box.configure(state="disabled")
+
+    # ---- header
+    header = ttk.Frame(root, padding=(18, 14, 18, 6))
+    header.pack(fill="x")
+    ttk.Label(header, text="Lossless Compressor", style="Title.TLabel").pack(anchor="w")
+    ttk.Label(
+        header,
+        text="Shrink files and folders, then get them back exactly as they were: "
+        "every pixel, every byte.",
+        style="Sub.TLabel",
+    ).pack(anchor="w")
+
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True, padx=14, pady=(6, 14))
+
+    def make_tree(parent, columns, widths):
+        frame = ttk.Frame(parent)
+        tree = ttk.Treeview(frame, columns=[c for c, _ in columns], show="headings")
+        for (key, title), width in zip(columns, widths):
+            anchor = "e" if key == "size" else "w"
+            tree.heading(key, text=title, anchor=anchor)
+            tree.column(key, width=width, anchor=anchor, stretch=key in ("name", "path"))
+        bar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=bar.set)
+        tree.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+        return frame, tree
+
+    def path_row(parent, label, browse):
+        row = ttk.Frame(parent)
+        ttk.Label(row, text=label, width=12).pack(side="left")
+        var = tk.StringVar()
+        ttk.Entry(row, textvariable=var).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Button(row, text="Browse...", command=browse).pack(side="left")
+        return row, var
+
+    def result_area(parent):
+        frame = ttk.Frame(parent)
+        frame.columnconfigure(0, weight=1)
+        main = ttk.Label(frame, text="", style="Big.TLabel")
+        main.grid(row=0, column=0, sticky="w")
+        detail = ttk.Label(frame, text="", style="Hint.TLabel")
+        detail.grid(row=1, column=0, sticky="w")
+        button = ttk.Button(frame, text="Open folder")
+        button.grid(row=0, column=1, rowspan=2, sticky="e")
+        button.grid_remove()
+        return frame, main, detail, button
+
+    # ---- Compress tab
+    ctab = ttk.Frame(notebook, padding=14)
+    notebook.add(ctab, text="Compress")
+
+    items = {}  # tree item id -> path
+    sizes = {}  # tree item id -> (bytes, file count)
+
+    tools = ttk.Frame(ctab)
+    tools.pack(fill="x")
+    ttk.Label(tools, text="Files and folders to compress", style="Big.TLabel").pack(side="left")
+    summary = ttk.Label(tools, text="", style="Hint.TLabel")
+    summary.pack(side="right")
+
+    tree_frame, ctree = make_tree(
+        ctab,
+        [("name", "Name"), ("type", "Type"), ("size", "Size"), ("path", "Location")],
+        [220, 80, 100, 300],
+    )
+    empty_hint = ttk.Label(
+        ctree,
+        text=("Drag files here, or use the buttons below" if DND_FILES
+              else "Click \"Add files\" or \"Add folder\" to get started"),
+        style="Sub.TLabel",
+    )
+
+    def refresh_summary():
+        if items:
+            empty_hint.place_forget()
+        else:
+            empty_hint.place(relx=0.5, rely=0.5, anchor="center")
+        total = sum(s for s, _ in sizes.values())
+        files = sum(c for _, c in sizes.values())
+        pending = len(items) - len(sizes)
+        text = f"{len(items)} item(s), {files} file(s), {human(total)}" if items else ""
+        summary.configure(text=text + (" (measuring...)" if pending else ""))
+
+    def add_paths(paths):
+        known = set(items.values())
+        for p in paths:
+            p = os.path.abspath(p)
+            if p in known or not os.path.lexists(p):
+                continue
+            known.add(p)
+            is_dir = os.path.isdir(p)
+            iid = ctree.insert(
+                "", "end",
+                values=(os.path.basename(p.rstrip(os.sep)) or p,
+                        "Folder" if is_dir else "File", "...", os.path.dirname(p)),
+            )
+            items[iid] = p
+
+            def measure(iid=iid, p=p):
+                try:
+                    result = folder_size(p)
+                except OSError:
+                    result = (0, 0)
+
+                def done():
+                    if iid in items:
+                        sizes[iid] = result
+                        ctree.set(iid, "size", human(result[0]))
+                        refresh_summary()
+
+                call_ui(done)
+
+            threading.Thread(target=measure, daemon=True).start()
+        if items and not out_var.get():
+            first = next(iter(items.values()))
+            name = os.path.basename(first.rstrip(os.sep)) if len(items) == 1 else "Compressed"
+            name = os.path.splitext(name)[0] if os.path.isfile(first) else name
+            out_var.set(os.path.join(os.path.dirname(first), name + EXTENSION))
+        refresh_summary()
 
     def add_files():
-        for p in filedialog.askopenfilenames(title="Add files"):
-            items.append(p)
-            listbox.insert("end", p)
+        add_paths(filedialog.askopenfilenames(title="Add files"))
 
     def add_folder():
         p = filedialog.askdirectory(title="Add folder")
         if p:
-            items.append(p)
-            listbox.insert("end", p + os.sep)
+            add_paths([p])
 
     def remove_selected():
-        for i in reversed(listbox.curselection()):
-            listbox.delete(i)
-            del items[i]
+        for iid in ctree.selection():
+            ctree.delete(iid)
+            items.pop(iid, None)
+            sizes.pop(iid, None)
+        refresh_summary()
 
-    buttons = tk.Frame(top)
-    buttons.pack(fill="x")
-    tk.Button(buttons, text="Add files...", command=add_files).pack(side="left")
-    tk.Button(buttons, text="Add folder...", command=add_folder).pack(side="left", padx=4)
-    tk.Button(buttons, text="Remove selected", command=remove_selected).pack(side="left")
+    def clear_all():
+        for iid in list(items):
+            ctree.delete(iid)
+        items.clear()
+        sizes.clear()
+        out_var.set("")
+        refresh_summary()
 
-    log_box = scrolledtext.ScrolledText(top, height=12, state="disabled")
-    log_box.pack(fill="both", expand=True, pady=(8, 6))
+    ctree.bind("<Delete>", lambda e: remove_selected())
+    ctree.bind("<BackSpace>", lambda e: remove_selected())
 
-    def log(msg):
-        def write():
-            log_box.configure(state="normal")
-            log_box.insert("end", msg + "\n")
-            log_box.see("end")
-            log_box.configure(state="disabled")
-        root.after(0, write)
+    if DND_FILES:
+        ctree.drop_target_register(DND_FILES)
+        ctree.dnd_bind("<<Drop>>", lambda e: add_paths(root.tk.splitlist(e.data)))
 
-    action_buttons = []
+    buttons = ttk.Frame(ctab)
+    ttk.Button(buttons, text="+ Add files", command=add_files).pack(side="left")
+    ttk.Button(buttons, text="+ Add folder", command=add_folder).pack(side="left", padx=6)
+    ttk.Button(buttons, text="Remove selected", command=remove_selected).pack(side="left")
+    ttk.Button(buttons, text="Clear all", command=clear_all).pack(side="left", padx=6)
 
-    def run_job(job):
-        for b in action_buttons:
-            b.configure(state="disabled")
+    level_names = {
+        "Best: smallest file (slower)": "best",
+        "Normal": "normal",
+        "Fast: bigger file (quicker)": "fast",
+    }
+    level_var = tk.StringVar(value=next(iter(level_names)))
+    level_row = ttk.Frame(ctab)
+    ttk.Label(level_row, text="Compression:", width=12).pack(side="left")
+    ttk.Combobox(
+        level_row, textvariable=level_var, values=list(level_names), state="readonly", width=30
+    ).pack(side="left")
+
+    def browse_output():
+        p = filedialog.asksaveasfilename(
+            title="Save compressed archive as",
+            defaultextension=EXTENSION,
+            initialfile=os.path.basename(out_var.get()) or "Compressed" + EXTENSION,
+            filetypes=[("Compressed archive", "*" + EXTENSION)],
+        )
+        if p:
+            out_var.set(p)
+
+    out_row, out_var = path_row(ctab, "Save as:", browse_output)
+
+    c_action = ttk.Frame(ctab)
+    c_button = ttk.Button(c_action, text="Compress", style="Accent.TButton")
+    c_button.pack(side="right")
+    c_prog = ttk.Progressbar(c_action, maximum=1000)
+    c_prog.pack(side="left", fill="x", expand=True, padx=(0, 12))
+    c_status = ttk.Label(ctab, text="", style="Hint.TLabel")
+    c_result, c_main, c_detail, c_open = result_area(ctab)
+    # Bottom-up, so the controls always stay visible and the list gets the rest.
+    c_result.pack(side="bottom", fill="x", pady=(6, 0))
+    c_status.pack(side="bottom", fill="x", pady=(4, 0))
+    c_action.pack(side="bottom", fill="x", pady=(12, 0))
+    out_row.pack(side="bottom", fill="x", pady=(8, 0))
+    level_row.pack(side="bottom", fill="x", pady=(10, 0))
+    buttons.pack(side="bottom", fill="x")
+    tree_frame.pack(fill="both", expand=True, pady=(8, 6))
+
+    # ---- Extract tab
+    xtab = ttk.Frame(notebook, padding=14)
+    notebook.add(xtab, text="Extract")
+
+    def browse_archive():
+        p = filedialog.askopenfilename(
+            title="Choose an archive to extract",
+            filetypes=[("Compressed archive", "*" + EXTENSION), ("All files", "*")],
+        )
+        if p:
+            load_archive(p)
+
+    arc_row, arc_var = path_row(xtab, "Archive:", browse_archive)
+    arc_row.pack(fill="x")
+
+    def browse_dest():
+        p = filedialog.askdirectory(title="Extract into which folder?")
+        if p:
+            dest_var.set(p)
+
+    dest_row, dest_var = path_row(xtab, "Extract to:", browse_dest)
+    dest_row.pack(fill="x", pady=(8, 0))
+
+    xinfo = ttk.Label(xtab, text="Choose an archive to see what is inside.", style="Hint.TLabel")
+    xinfo.pack(fill="x", pady=(12, 0))
+    xtree_frame, xtree = make_tree(xtab, [("name", "Name"), ("size", "Size")], [500, 120])
+
+    def load_archive(path):
+        arc_var.set(path)
+        dest_var.set(default_extract_dir(path))
+        xtree.delete(*xtree.get_children())
+        xinfo.configure(text="Reading archive...")
+
+        def work():
+            try:
+                rows = contents(path)
+            except Exception as e:
+                call_ui(lambda e=e: xinfo.configure(text=f"Cannot read this archive: {e}"))
+                return
+
+            def show():
+                if arc_var.get() != path:
+                    return
+                for name, is_dir, nbytes in rows:
+                    xtree.insert("", "end", values=(name + ("/" if is_dir else ""),
+                                                    "" if is_dir else human(nbytes)))
+                total = sum(r[2] for r in rows)
+                files = sum(1 for r in rows if not r[1])
+                packed = os.path.getsize(path)
+                saved = (1 - packed / total) * 100 if total else 0
+                xinfo.configure(
+                    text=f"{files} file(s). Original size {human(total)}, "
+                    f"compressed {human(packed)} ({saved:.0f}% smaller)."
+                )
+
+            call_ui(show)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    if DND_FILES:
+        xtree.drop_target_register(DND_FILES)
+        xtree.dnd_bind("<<Drop>>", lambda e: load_archive(root.tk.splitlist(e.data)[0]))
+
+    x_action = ttk.Frame(xtab)
+    x_button = ttk.Button(x_action, text="Extract", style="Accent.TButton")
+    x_button.pack(side="right")
+    x_prog = ttk.Progressbar(x_action, maximum=1000)
+    x_prog.pack(side="left", fill="x", expand=True, padx=(0, 12))
+    x_status = ttk.Label(xtab, text="", style="Hint.TLabel")
+    x_result, x_main, x_detail, x_open = result_area(xtab)
+    x_result.pack(side="bottom", fill="x", pady=(6, 0))
+    x_status.pack(side="bottom", fill="x", pady=(4, 0))
+    x_action.pack(side="bottom", fill="x", pady=(12, 0))
+    xtree_frame.pack(fill="both", expand=True, pady=(6, 0))
+
+    # ---- Details tab
+    ltab = ttk.Frame(notebook, padding=14)
+    notebook.add(ltab, text="Details")
+    log_box = scrolledtext.ScrolledText(ltab, state="disabled", relief="flat",
+                                        font=(tkfont.nametofont("TkFixedFont").actual("family"), size - 1))
+    log_box.pack(fill="both", expand=True)
+
+    # ---- running jobs
+    widgets = {
+        "compress": (c_button, c_prog, c_status, c_main, c_detail, c_open, "Compress"),
+        "extract": (x_button, x_prog, x_status, x_main, x_detail, x_open, "Extract"),
+    }
+
+    def start_job(kind, work, on_success):
+        button, prog, status, main, detail, open_btn, _ = widgets[kind]
+        cancel = threading.Event()
+        state.update(busy=kind, cancel=cancel, progress=(0.0, "Starting..."))
+        for k, w in widgets.items():
+            w[0].configure(text="Cancel" if k == kind else w[6],
+                           state="normal" if k == kind else "disabled")
+        main.configure(text="", style="Big.TLabel")
+        detail.configure(text="")
+        open_btn.grid_remove()
 
         def worker():
             try:
-                job()
-            except Exception as e:  # show any error in a dialog
-                log(f"ERROR: {e}")
-                root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                result = work(cancel)
+                call_ui(lambda: on_success(result))
+            except Cancelled:
+                call_ui(lambda: main.configure(text="Cancelled.", style="Err.TLabel"))
+            except Exception as e:
+                msg = str(e)
+                log(f"ERROR: {msg}")
+                call_ui(lambda: (main.configure(text="Something went wrong.", style="Err.TLabel"),
+                                 messagebox.showerror("Error", msg)))
             finally:
-                root.after(0, lambda: [b.configure(state="normal") for b in action_buttons])
+                call_ui(finish_job)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def do_compress():
+    def finish_job():
+        kind = state["busy"]
+        state.update(busy=None, cancel=None, progress=None)
+        for k, w in widgets.items():
+            w[0].configure(text=w[6], state="normal")
+            if k == kind:
+                w[2].configure(text="")
+
+    def show_success(kind, headline, detail_text, folder):
+        _, prog, _, main, detail, open_btn, _ = widgets[kind]
+        prog.configure(value=1000)
+        main.configure(text="✔ " + headline, style="Ok.TLabel")
+        detail.configure(text=detail_text)
+        open_btn.configure(command=lambda: open_in_file_manager(folder))
+        open_btn.grid()
+
+    def on_compress_click():
+        if state["busy"] == "compress":
+            state["cancel"].set()
+            return
         if not items:
-            messagebox.showinfo("Nothing to do", "Add some files or folders first.")
+            messagebox.showinfo("Nothing to compress", "Add some files or folders first.")
             return
-        out = filedialog.asksaveasfilename(
-            title="Save compressed archive as",
-            defaultextension=EXTENSION,
-            filetypes=[("Compressed archive", "*" + EXTENSION)],
-        )
-        if out:
-            run_job(lambda: compress(out, list(items), log=log))
-
-    def do_extract():
-        archive = filedialog.askopenfilename(
-            title="Choose archive to extract",
-            filetypes=[("Compressed archive", "*" + EXTENSION), ("All files", "*")],
-        )
-        if not archive:
+        out = out_var.get().strip()
+        if not out:
+            browse_output()
+            out = out_var.get().strip()
+            if not out:
+                return
+        if not out.endswith(EXTENSION):
+            out += EXTENSION
+        if os.path.exists(out) and not messagebox.askyesno(
+            "Replace file?", f"{os.path.basename(out)} already exists. Replace it?"
+        ):
             return
-        dest = filedialog.askdirectory(title="Extract into which folder?")
-        if dest:
-            run_job(lambda: extract(archive, dest, log=log))
+        paths = list(items.values())
+        level = level_names[level_var.get()]
+        log(f"Compressing {len(paths)} item(s) into {out}")
 
-    bottom = tk.Frame(top)
-    bottom.pack(fill="x")
-    b1 = tk.Button(bottom, text="Compress", width=16, command=do_compress)
-    b2 = tk.Button(bottom, text="Extract archive...", width=16, command=do_extract)
-    b1.pack(side="left")
-    b2.pack(side="right")
-    action_buttons.extend([b1, b2])
+        def work(cancel):
+            return compress(out, paths, level=level, log=log, cancel=cancel,
+                            progress=lambda f, t: state.__setitem__("progress", (f, t)))
 
+        def success(s):
+            show_success(
+                "compress",
+                f"{human(s['original'])}  →  {human(s['packed'])}   "
+                f"({s['saved']:.1f}% smaller)",
+                f"{s['files']} file(s) in {s['seconds']:.1f}s. "
+                "Verified: every file is stored exactly.",
+                os.path.dirname(os.path.abspath(s["output"])),
+            )
+
+        start_job("compress", work, success)
+
+    def on_extract_click():
+        if state["busy"] == "extract":
+            state["cancel"].set()
+            return
+        archive = arc_var.get().strip()
+        if not archive or not os.path.isfile(archive):
+            messagebox.showinfo("No archive", "Choose an archive to extract first.")
+            return
+        dest = dest_var.get().strip() or default_extract_dir(archive)
+        log(f"Extracting {archive} into {dest}")
+
+        def work(cancel):
+            return extract(archive, dest, log=log, cancel=cancel,
+                           progress=lambda f, t: state.__setitem__("progress", (f, t)))
+
+        def success(s):
+            if s["files"] is None:
+                headline, detail_text = "Extracted", "No checksums in this archive to verify."
+            else:
+                headline = f"{s['files']} file(s) restored ({human(s['original'])})"
+                detail_text = "Verified: identical to the originals, nothing lost."
+            show_success("extract", headline, detail_text, s["dest"])
+
+        start_job("extract", work, success)
+
+    c_button.configure(command=on_compress_click)
+    x_button.configure(command=on_extract_click)
+
+    def poll():
+        while True:
+            try:
+                ui_queue.get_nowait()()
+            except queue.Empty:
+                break
+        busy, prog = state["busy"], state["progress"]
+        if busy and prog:
+            _, bar, status, *_ = widgets[busy]
+            bar.configure(value=int(prog[0] * 1000))
+            status.configure(text=f"{prog[1]}  {prog[0] * 100:.0f}%")
+        root.after(80, poll)
+
+    def on_close():
+        if state["busy"] and not messagebox.askyesno(
+            "Still working", "A job is still running. Stop it and quit?"
+        ):
+            return
+        if state["cancel"]:
+            state["cancel"].set()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    refresh_summary()
+    # Paths passed to the GUI (e.g. dropped onto the launcher icon).
+    for arg in sys.argv[1:]:
+        if arg.endswith(EXTENSION) and os.path.isfile(arg):
+            notebook.select(xtab)
+            load_archive(arg)
+        else:
+            add_paths([arg])
+    poll()
     root.mainloop()
 
 
@@ -335,7 +869,7 @@ def run_gui():
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if not argv:
+    if not argv or argv[0] not in ("compress", "extract", "list", "-h", "--help"):
         try:
             run_gui()
             return 0
@@ -348,6 +882,8 @@ def main(argv=None):
     c = sub.add_parser("compress", help="pack files/folders into an archive")
     c.add_argument("output", help="archive to create (.tar.xz is added if missing)")
     c.add_argument("inputs", nargs="+", help="files and folders to include")
+    c.add_argument("--level", choices=list(LEVELS), default="best",
+                   help="best = smallest (default), fast = quickest")
     x = sub.add_parser("extract", help="unpack an archive")
     x.add_argument("archive")
     x.add_argument("dest", nargs="?", help="destination folder (default: next to archive)")
@@ -357,7 +893,7 @@ def main(argv=None):
 
     try:
         if args.cmd == "compress":
-            compress(args.output, args.inputs)
+            compress(args.output, args.inputs, level=args.level)
         elif args.cmd == "extract":
             extract(args.archive, args.dest)
         else:
