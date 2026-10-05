@@ -1,14 +1,14 @@
-# Lossless Compressor
+# Core Compressor
 
 Packs files and folders into one smaller archive. When you extract it, every file comes back **byte-for-byte identical** to the original, so images keep every pixel and documents keep every detail.
 
-![The Lossless Compressor window](screenshot.png)
+![The Core Compressor window](screenshot.png)
 
 ## How to use
 
 You need Python 3.8 or newer (get it from [python.org](https://www.python.org/downloads/)). Nothing else has to be installed.
 
-**Open the window:** double-click **`Lossless Compressor.pyw`**. On Windows this opens without a black terminal window. On Mac or Linux, run `python3 lossless_compressor.py` instead.
+**Open the window:** double-click **`Core Compressor.pyw`**. On Windows this opens without a black terminal window. On Mac or Linux, run `python3 core_compressor.py` instead.
 
 **Compress tab**
 1. Click **+ Add files** or **+ Add folder**. Add as many as you like; the list shows their sizes.
@@ -41,11 +41,11 @@ Optional: run `pip install tkinterdnd2` to also drag and drop files onto the win
 **From the command line:**
 
 ```
-python lossless_compressor.py compress MyStuff.tar.xz photo.png "My Folder" notes.txt
-python lossless_compressor.py compress MyStuff.tar.xz "My Folder" --level fast --threads 4
-python lossless_compressor.py download MyDownloads.tar.xz "https://drive.google.com/file/d/.../view" --keep
-python lossless_compressor.py list     MyStuff.tar.xz
-python lossless_compressor.py extract  MyStuff.tar.xz  RestoredFolder
+python core_compressor.py compress MyStuff.tar.xz photo.png "My Folder" notes.txt
+python core_compressor.py compress MyStuff.tar.xz "My Folder" --level fast --threads 4
+python core_compressor.py download MyDownloads.tar.xz "https://drive.google.com/file/d/.../view" --keep
+python core_compressor.py list     MyStuff.tar.xz
+python core_compressor.py extract  MyStuff.tar.xz  RestoredFolder
 ```
 
 ## Speed settings

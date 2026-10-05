@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lossless Compressor - pack files and folders into one smaller archive and
+Core Compressor - pack files and folders into one smaller archive and
 unpack them later bit-for-bit identical (no lost pixels, quality or detail).
 
 How it works
@@ -12,10 +12,10 @@ How it works
   * The archive is a normal .tar.xz, so 7-Zip, WinRAR, tar etc. can open it too.
 
 Usage
-  python lossless_compressor.py                      # opens the window (GUI)
-  python lossless_compressor.py compress OUT.tar.xz FILE_OR_FOLDER [...]
-  python lossless_compressor.py extract ARCHIVE.tar.xz [DEST_FOLDER]
-  python lossless_compressor.py list ARCHIVE.tar.xz
+  python core_compressor.py                      # opens the window (GUI)
+  python core_compressor.py compress OUT.tar.xz FILE_OR_FOLDER [...]
+  python core_compressor.py extract ARCHIVE.tar.xz [DEST_FOLDER]
+  python core_compressor.py list ARCHIVE.tar.xz
 
 Only the Python standard library is used (Python 3.8+). If the optional
 package "tkinterdnd2" is installed, you can drag files onto the window.
@@ -536,7 +536,7 @@ def _unique_path(folder, name):
 
 
 SPLIT_MIN = 32 * 1024 * 1024  # files at least this big are fetched over several connections
-USER_AGENT = {"User-Agent": "Mozilla/5.0 LosslessCompressor"}
+USER_AGENT = {"User-Agent": "Mozilla/5.0 CoreCompressor"}
 _name_lock = threading.Lock()
 
 
@@ -787,7 +787,7 @@ def run_gui():
         DND_FILES = None
         root = tk.Tk()
 
-    root.title("Lossless Compressor")
+    root.title("Core Compressor")
     root.geometry("860x640")
     root.minsize(680, 520)
 
@@ -836,13 +836,7 @@ def run_gui():
     # ---- header
     header = ttk.Frame(root, padding=(18, 14, 18, 6))
     header.pack(fill="x")
-    ttk.Label(header, text="Lossless Compressor", style="Title.TLabel").pack(anchor="w")
-    ttk.Label(
-        header,
-        text="Shrink files and folders, then get them back exactly as they were: "
-        "every pixel, every byte.",
-        style="Sub.TLabel",
-    ).pack(anchor="w")
+    ttk.Label(header, text="Core Compressor", style="Title.TLabel").pack(anchor="w")
 
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=True, padx=14, pady=(6, 14))
@@ -1120,12 +1114,6 @@ def run_gui():
     notebook.add(dtab, text="Download")
     ttk.Label(dtab, text="Download from links and save them compressed",
               style="Big.TLabel").pack(anchor="w")
-    ttk.Label(
-        dtab,
-        text="Paste one link per line. Works with Google Drive and Google Docs files shared "
-        "as \"Anyone with the link\", Dropbox, and direct download links.",
-        style="Hint.TLabel", wraplength=780, justify="left",
-    ).pack(anchor="w", pady=(2, 0))
     links_frame = ttk.Frame(dtab)
     links = tk.Text(links_frame, height=6, wrap="none", relief="solid", borderwidth=1,
                     font=(family, size), undo=True)
@@ -1415,7 +1403,7 @@ def main(argv=None):
             print("tkinter is not available; use the command line (see --help).")
             return 1
 
-    parser = argparse.ArgumentParser(description="Lossless file/folder compressor.")
+    parser = argparse.ArgumentParser(description="Core Compressor: lossless file/folder compressor.")
     sub = parser.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("compress", help="pack files/folders into an archive")
     c.add_argument("output", help="archive to create (.tar.xz is added if missing)")
