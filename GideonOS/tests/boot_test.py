@@ -265,9 +265,14 @@ def mode_change_checks(t, vm):
     old = vm.run("pidof gideon-compositor")[1]
     t.check("set display.mode 1024x768", "gideon-config set display.mode 1024x768 && echo set", lambda o: o.endswith("set"))
     vm.run("kill $(pidof gideon-compositor)")
-    t.check("graphical session restarts with the new settings",
-            wait_for(f"[ -n \"$(pidof gideon-compositor)\" ] && [ \"$(pidof gideon-compositor)\" != '{old}' ]", 60)
-            + " && echo restarted", lambda o: o.endswith("restarted"), 90)
+    if t.check("graphical session restarts with the new settings",
+               wait_for(f"[ -n \"$(pidof gideon-compositor)\" ] && [ \"$(pidof gideon-compositor)\" != '{old}' ]", 60)
+               + " && echo restarted", lambda o: o.endswith("restarted"), 90) is None:
+        # Diagnostics for a slow or stuck restart.
+        print(vm.run(f"pidof gideon-compositor; cat /proc/{old}/wchan /proc/{old}/stack 2>&1; ls -l /proc/{old}/task 2>&1 | tail -n +2;"
+                     " for t in /proc/" + old + "/task/*; do echo $t $(cat $t/comm $t/wchan); done;"
+                     " tail -15 /run/user/1000/gideon/compositor.log | cut -c1-200;"
+                     " journalctl -b --since -100s --no-pager | grep -v 'timesyncd' | tail -30 | cut -c1-200", 60)[1])
     img = wait_until(lambda: (lambda i: i if (i.width, i.height) == (1024, 768) else None)(vm.screendump(0)), 60, "1024x768 at startup")
     t.expect_true("display starts at the configured 1024x768", (img.width, img.height) == (1024, 768))
     vm.run("gideon-config reset display.mode")
