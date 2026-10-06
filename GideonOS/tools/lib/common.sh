@@ -14,7 +14,7 @@ JOBS="${JOBS:-$(nproc 2>/dev/null || echo 2)}"
 # shellcheck source=../../config/versions.env
 source "$GIDEON_ROOT/config/versions.env"
 
-# Reproducibility: pin timestamps and identity so outputs depend only on inputs.
+# Reproducibility: pin timestamps (mksquashfs, xorriso and gzip -n honour it too) and identity so outputs depend only on inputs.
 # Default epoch is the last commit touching the tree; falls back to a constant.
 if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
     SOURCE_DATE_EPOCH="$(git -C "$GIDEON_ROOT" log -1 --format=%ct -- . 2>/dev/null || true)"

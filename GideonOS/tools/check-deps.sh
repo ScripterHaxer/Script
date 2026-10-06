@@ -20,7 +20,7 @@ BUILD_DEPS=(
   "curl|cmd|curl|curl|curl|curl|source downloads"
   "xz|cmd|xz|xz-utils|xz|xz|kernel tarball"
   "bzip2|cmd|bzip2|bzip2|bzip2|bzip2|BusyBox tarball"
-  "cpio|cmd|cpio|cpio|cpio|cpio|initramfs archive"
+  "mksquashfs|cmd|mksquashfs|squashfs-tools|squashfs-tools|squashfs-tools|root filesystem image"
   "gzip|cmd|gzip|gzip|gzip|gzip|initramfs compression"
   "xorriso|cmd|xorriso|xorriso|xorriso|libisoburn|ISO image creation"
   "mformat|cmd|mformat|mtools|mtools|mtools|UEFI boot image in ISO"
@@ -34,6 +34,8 @@ RUN_DEPS=(
   "qemu|cmd|qemu-system-x86_64|qemu-system-x86|qemu-system-x86|qemu-system-x86|run.sh / boot tests"
   "python3|cmd|python3|python3|python3|python|automated boot tests"
   "ovmf|file|/usr/share/ovmf/OVMF.fd|ovmf|edk2-ovmf|edk2-ovmf|UEFI boot in QEMU (optional)"
+  "mkfs.vfat|cmd|mkfs.vfat|dosfstools|dosfstools|dosfstools|USB storage test images"
+  "mcopy|cmd|mcopy|mtools|mtools|mtools|USB storage test images"
 )
 
 probe() {

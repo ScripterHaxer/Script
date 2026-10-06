@@ -5,7 +5,7 @@ source "$(dirname "$0")/../lib/common.sh"
 src="$SRC_DIR/linux-$LINUX_VERSION"
 obj="$BUILD_DIR/kernel-obj"
 out="$OUT_DIR/vmlinuz"
-key="$(hash_inputs config/kernel config/versions.env tools/build/kernel.sh)"
+key="$(hash_inputs config/kernel tools/build/kernel.sh)-$LINUX_VERSION-$LINUX_SHA256"
 
 if stamp_ok kernel "$key" && [[ -f "$out" ]]; then ok "kernel up to date"; exit 0; fi
 

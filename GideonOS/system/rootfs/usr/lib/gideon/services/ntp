@@ -1,0 +1,9 @@
+description="Network time synchronisation"
+requires="network"
+type=daemon
+prepare() {
+    peers=""
+    for s in $(gideon-config get time.ntp_servers pool.ntp.org); do peers="$peers -p $s"; done
+    exec="ntpd -n -N $peers"
+}
+exec="false"

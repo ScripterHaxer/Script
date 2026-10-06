@@ -1,0 +1,4 @@
+#!/bin/sh
+# Power button pressed: clean shutdown.
+logger -t acpid "power button pressed: shutting down"
+exec poweroff

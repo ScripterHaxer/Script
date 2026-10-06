@@ -1,0 +1,87 @@
+#!/bin/sh
+# GideonOS initramfs: locate the boot medium, mount the read-only root image
+# with a RAM overlay on top, and hand over to the real init.
+#
+# Kernel command line options:
+#   gideon.verify=1        verify the root image SHA-256 before using it
+#   gideon.break=premount  drop to a shell before searching for the medium
+#   gideon.break=preinit   drop to a shell just before switch_root
+#   gideon.timeout=N       seconds to wait for the boot medium (default 30)
+
+/bin/busybox --install -s /bin
+export PATH=/bin
+
+mount -t proc  -o nosuid,noexec,nodev proc /proc
+mount -t sysfs -o nosuid,noexec,nodev sysfs /sys
+mount -t devtmpfs -o nosuid,mode=0755 devtmpfs /dev
+mount -t tmpfs -o nosuid,nodev,mode=0755 tmpfs /run
+
+msg() { echo "gideon-initramfs: $*" > /dev/kmsg; }
+rescue() {
+    # Priority <2> (critical) reaches every kernel console, even with `quiet`.
+    echo "<2>gideon-initramfs: $*" > /dev/kmsg
+    echo "Dropping to a rescue shell. Exit the shell to retry boot." > /dev/console
+    setsid cttyhack sh
+}
+
+verify=0 brk="" timeout=30
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        gideon.verify=1)   verify=1 ;;
+        gideon.break=*)    brk="${arg#gideon.break=}" ;;
+        gideon.timeout=*)  timeout="${arg#gideon.timeout=}" ;;
+    esac
+done
+want="$(cat /etc/gideon-rootfs.sha256)"
+[ "$brk" = premount ] && rescue "break requested (premount)"
+
+media=/run/rootfs/media lower=/run/rootfs/lower rw=/run/rootfs/rw
+mkdir -p "$media" "$lower" "$rw"
+
+# Look for an ISO9660 filesystem carrying the root image this initramfs was
+# built for. Matching the checksum file avoids booting a mismatched image
+# (e.g. two GideonOS sticks plugged in at once).
+find_media() {
+    for dev in /dev/sr[0-9]* /dev/sd[a-z]* /dev/vd[a-z]* /dev/nvme[0-9]*n[0-9]* /dev/mmcblk[0-9]*; do
+        [ -b "$dev" ] || continue
+        mount -t iso9660 -o ro "$dev" "$media" 2>/dev/null || continue
+        if [ "$(cat "$media/gideon/rootfs.squashfs.sha256" 2>/dev/null)" = "$want" ]; then
+            msg "boot medium found on $dev"
+            return 0
+        fi
+        umount "$media"
+    done
+    return 1
+}
+
+waited=0
+until find_media; do
+    [ "$waited" -ge "$timeout" ] && { rescue "boot medium with root image $want not found"; waited=0; continue; }
+    sleep 1; waited=$((waited + 1))
+done
+
+if [ "$verify" = 1 ]; then
+    echo "gideon-initramfs: verifying root image..." > /dev/console
+    got="$(sha256sum "$media/gideon/rootfs.squashfs" | cut -d' ' -f1)"
+    [ "$got" = "$want" ] || rescue "root image checksum mismatch (got $got)"
+    echo "gideon-initramfs: root image OK" > /dev/console
+fi
+
+mount -t squashfs -o ro,loop "$media/gideon/rootfs.squashfs" "$lower" || rescue "cannot mount root image"
+# Writable layer lives in RAM (live system). A separate tmpfs keeps it out of
+# /run's nosuid restriction and makes its size accountable on its own.
+mount -t tmpfs -o mode=0755 tmpfs "$rw"
+mkdir -p "$rw/upper" "$rw/work"
+mkdir -p /newroot
+mount -t overlay overlay -o "lowerdir=$lower,upperdir=$rw/upper,workdir=$rw/work" /newroot \
+    || rescue "cannot mount overlay root"
+
+[ "$brk" = preinit ] && rescue "break requested (preinit)"
+
+# Hand kernel filesystems to the real root; /run carries the media, lower
+# and rw mounts along with it so they stay visible at /run/rootfs.
+mount --move /dev /newroot/dev
+mount --move /run /newroot/run
+umount /sys /proc
+msg "switching to root filesystem"
+exec switch_root /newroot /sbin/init

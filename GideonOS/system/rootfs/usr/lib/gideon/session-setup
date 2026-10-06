@@ -1,0 +1,22 @@
+#!/bin/sh
+# Runs as root from login(1) for an authenticated user (LOGIN_* variables).
+# Creates the private runtime directory and records the session.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+case "$LOGIN_UID" in ''|*[!0-9]*) exit 0 ;; esac
+rt="/run/user/$LOGIN_UID"
+if [ ! -d "$rt" ] || [ -L "$rt" ]; then
+    rm -f "$rt"
+    mkdir -m 0700 "$rt"
+fi
+chown "$LOGIN_UID:$LOGIN_GID" "$rt"
+chmod 0700 "$rt"
+
+# The login process (our parent) execs the user's shell, so its PID is the
+# session leader. Records are root-owned; stale ones are pruned by PID.
+tty="${LOGIN_TTY#/dev/}"
+rec="/run/gideon/sessions/$(echo "$tty" | tr / _)"
+printf 'user=%s\nuid=%s\ntty=%s\npid=%s\nstarted=%s\n' \
+    "$LOGIN_USER" "$LOGIN_UID" "$tty" "$PPID" "$(date +%s)" > "$rec.tmp"
+mv "$rec.tmp" "$rec"
+logger -t session "login: $LOGIN_USER on $tty"
+exit 0

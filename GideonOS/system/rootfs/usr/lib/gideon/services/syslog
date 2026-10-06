@@ -1,0 +1,11 @@
+description="System log daemon (/var/log/messages)"
+type=daemon
+# -L is required: BusyBox 1.37.0 syslogd_init() sets the implicit "log locally"
+# flag in option_mask32 but returns the getopt result without it, so without
+# an explicit -L every message from /dev/log is silently dropped.
+prepare() {
+    size="$(gideon-config get logging.max_size_kb 512)"
+    rotate="$(gideon-config get logging.rotate 4)"
+    exec="syslogd -n -L -O /var/log/messages -s $size -b $rotate"
+}
+exec="syslogd -n -L -O /var/log/messages"

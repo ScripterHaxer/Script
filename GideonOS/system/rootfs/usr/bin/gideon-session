@@ -1,0 +1,32 @@
+#!/bin/sh
+# gideon-session: the login session for GideonOS users (their login shell).
+# Milestone 2 runs an interactive shell; from M3 this starts the graphical
+# session (compositor + shell). `gideon-session --list` shows active sessions.
+if [ "${1:-}" = --list ]; then
+    printf '%-10s %-6s %-8s %-7s %s\n' USER UID TTY PID SINCE
+    for rec in /run/gideon/sessions/*; do
+        [ -f "$rec" ] || continue
+        unset user uid tty pid started
+        . "$rec"
+        # Prune sessions whose leader has exited (or whose PID was reused).
+        if [ ! -d "/proc/$pid" ] || [ "$(stat -c %u "/proc/$pid")" != "$uid" ]; then
+            [ "$(id -u)" = 0 ] && rm -f "$rec"
+            continue
+        fi
+        printf '%-10s %-6s %-8s %-7s %s\n' "$user" "$uid" "$tty" "$pid" "$(date -d "@$started" '+%F %T')"
+    done
+    exit 0
+fi
+
+uid="$(id -u)"
+if [ -d "/run/user/$uid" ] && [ "$(stat -c %u:%a "/run/user/$uid")" = "$uid:700" ]; then
+    export XDG_RUNTIME_DIR="/run/user/$uid"
+else
+    echo "gideon-session: no private runtime directory; continuing without XDG_RUNTIME_DIR" >&2
+fi
+export XDG_SESSION_TYPE=tty XDG_SESSION_CLASS=user XDG_CONFIG_HOME="$HOME/.config"
+export SHELL=/bin/sh
+
+# Non-interactive use (su -c, scripts) passes straight to the shell.
+[ $# -gt 0 ] && exec /bin/sh "$@"
+exec /bin/sh -l

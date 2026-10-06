@@ -1,0 +1,123 @@
+#!/bin/sh
+# gideon-config: read and write layered GideonOS configuration.
+#
+#   gideon-config get KEY [DEFAULT]   effective value (exit 1 if unset and no default)
+#   gideon-config set KEY VALUE       write to /etc/gideon (machine) or ~/.config/gideon (--user)
+#   gideon-config reset KEY           remove the override, falling back to lower layers
+#   gideon-config list [DOMAIN]       effective values with the layer each comes from
+#   options: --user   operate on the per-user layer
+#
+# KEY is DOMAIN.NAME, e.g. system.hostname -> file DOMAIN.conf, line NAME = VALUE.
+# Layers, lowest to highest precedence:
+#   /usr/share/gideon/defaults  (read-only, part of the OS image)
+#   /etc/gideon                 (machine-wide)
+#   ~/.config/gideon            (per user; only consulted with --user)
+# Files are a flat TOML subset: NAME = "string" | true | false | integer.
+set -eu
+
+DEFAULTS=/usr/share/gideon/defaults
+MACHINE=/etc/gideon
+USERDIR="${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/gideon"
+
+user=0
+[ "${1:-}" = --user ] && { user=1; shift; }
+
+die() { echo "gideon-config: $*" >&2; exit 2; }
+
+split_key() { # validates KEY, sets $domain and $name
+    case "$1" in
+        *[!a-z0-9_.-]*|.*|*.|*..*) die "invalid key '$1' (use domain.name, [a-z0-9_-])" ;;
+        *.*) domain="${1%%.*}" name="${1#*.}" ;;
+        *) die "key must be domain.name" ;;
+    esac
+    case "$name" in *.*) die "nested keys are not supported: '$1'" ;; esac
+}
+
+layers() { # files to consult for $domain, lowest precedence first
+    echo "$DEFAULTS/$domain.conf"
+    echo "$MACHINE/$domain.conf"
+    [ "$user" = 1 ] && echo "$USERDIR/$domain.conf"
+    return 0
+}
+
+# Print the value of $name in FILE (unquoted); exit status 1 if absent.
+read_value() {
+    [ -r "$1" ] || return 1
+    awk -v k="$2" '
+        /^[ \t]*(#|$)/ { next }
+        {
+            line = $0
+            eq = index(line, "="); if (!eq) next
+            key = substr(line, 1, eq - 1); gsub(/[ \t]/, "", key)
+            if (key != k) next
+            val = substr(line, eq + 1); sub(/^[ \t]+/, "", val); sub(/[ \t]+$/, "", val)
+            if (val ~ /^".*"$/) { val = substr(val, 2, length(val) - 2); gsub(/\\"/, "\"", val); gsub(/\\\\/, "\\", val) }
+            found = 1; out = val
+        }
+        END { if (found) print out; exit !found }' "$1"
+}
+
+encode() { # TOML-encode a value: booleans and integers bare, everything else quoted
+    case "$1" in
+        true|false) printf '%s' "$1" ;;
+        ''|*[!0-9-]*|?*-*) printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+    get)
+        [ $# -ge 1 ] || die "usage: get KEY [DEFAULT]"
+        split_key "$1"
+        value="" found=0
+        for f in $(layers); do
+            if v="$(read_value "$f" "$name")"; then value="$v" found=1; fi
+        done
+        if [ "$found" = 1 ]; then printf '%s\n' "$value"
+        elif [ $# -ge 2 ]; then printf '%s\n' "$2"
+        else exit 1; fi
+        ;;
+    set|reset)
+        [ "$cmd" = set ] && { [ $# -eq 2 ] || die "usage: set KEY VALUE"; }
+        [ "$cmd" = reset ] && { [ $# -eq 1 ] || die "usage: reset KEY"; }
+        split_key "$1"
+        case "${2:-}" in *"
+"*) die "values must be a single line" ;; esac
+        if [ "$user" = 1 ]; then dir="$USERDIR"; else dir="$MACHINE"; fi
+        mkdir -p "$dir"
+        file="$dir/$domain.conf"
+        tmp="$(mktemp "$dir/.$domain.conf.XXXXXX")"
+        trap 'rm -f "$tmp"' EXIT
+        if [ -f "$file" ]; then
+            awk -v k="$name" '{ line=$0; eq=index(line,"="); key=substr(line,1,eq-1); gsub(/[ \t]/,"",key) }
+                              eq && key==k && $0 !~ /^[ \t]*#/ { next } { print }' "$file" > "$tmp"
+            chmod "$(stat -c %a "$file")" "$tmp"
+        else
+            chmod 644 "$tmp"
+        fi
+        [ "$cmd" = set ] && printf '%s = %s\n' "$name" "$(encode "$2")" >> "$tmp"
+        mv "$tmp" "$file"   # atomic replace: readers never see a partial file
+        trap - EXIT
+        ;;
+    list)
+        doms="${1:-}"
+        if [ -z "$doms" ]; then
+            doms="$( { ls "$DEFAULTS" "$MACHINE"; [ "$user" = 1 ] && ls "$USERDIR"; } 2>/dev/null \
+                     | sed -n 's/\.conf$//p' | sort -u)"
+        fi
+        for domain in $doms; do
+            for f in $(layers); do
+                [ -r "$f" ] || continue
+                case "$f" in "$DEFAULTS"/*) origin=default ;; "$MACHINE"/*) origin=machine ;; *) origin=user ;; esac
+                awk -F= -v o="$origin" -v d="$domain" '!/^[ \t]*(#|$)/ && NF>1 { k=$1; gsub(/[ \t]/,"",k); print d "." k "\t" o }' "$f"
+            done
+        done | awk -F'\t' '{ origin[$1]=$2; if (!($1 in seen)) { seen[$1]=1; order[++n]=$1 } }
+                           END { for (i=1;i<=n;i++) print order[i] "\t" origin[order[i]] }' |
+        while IFS="$(printf '\t')" read -r key origin; do
+            printf '%-28s %-36s (%s)\n' "$key" "$("$0" $([ "$user" = 1 ] && echo --user) get "$key")" "$origin"
+        done
+        ;;
+    ''|-h|--help|help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown command '$cmd' (try --help)" ;;
+esac

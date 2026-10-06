@@ -1,0 +1,60 @@
+#!/bin/sh
+# Mount/unmount removable block devices under /media. Called by mdev on
+# hotplug (MDEV, ACTION in the environment) and by the storage service.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+[ -f /run/gideon/storage.active ] || exit 0
+[ "$(gideon-config get storage.automount true)" = true ] || exit 0
+dev="${MDEV:-}"; action="${ACTION:-add}"
+case "$dev" in ''|*/*|loop*|ram*|zram*) exit 0 ;; esac
+state=/run/gideon/media/$dev
+
+exec 9>/run/gideon/storage.lock
+flock 9
+
+removable() { # removable or USB-attached; walks up from a partition to its disk
+    sys="$(readlink -f "/sys/class/block/$dev")" || return 1
+    case "$sys" in */usb[0-9]*/*) return 0 ;; esac
+    disk="$sys"; [ -f "$sys/partition" ] && disk="${sys%/*}"
+    [ "$(cat "$disk/removable" 2>/dev/null)" = 1 ]
+}
+
+if [ "$action" = remove ]; then
+    [ -f "$state" ] || exit 0
+    mp="$(cat "$state")"
+    umount "$mp" 2>/dev/null || umount -l "$mp"
+    rmdir "$mp" 2>/dev/null
+    rm -f "$state"
+    logger -t storage "unmounted $dev from $mp"
+    exit 0
+fi
+
+[ "$action" = add ] || exit 0
+[ -f "$state" ] && exit 0
+[ -b "/dev/$dev" ] || exit 0
+removable || exit 0
+grep -q "^/dev/$dev " /proc/mounts && exit 0           # already mounted (e.g. boot medium)
+[ -d "/sys/class/block/$dev/holders" ] && [ -n "$(ls "/sys/class/block/$dev/holders")" ] && exit 0
+
+info="$(blkid "/dev/$dev")" || exit 0
+type="$(echo "$info" | sed -n 's/.* TYPE="\([^"]*\)".*/\1/p')"
+label="$(echo "$info" | sed -n 's/.* LABEL="\([^"]*\)".*/\1/p')"
+case " $(gideon-config get storage.automount_types "vfat ext4") " in *" $type "*) ;; *) exit 0 ;; esac
+
+name="$(echo "${label:-$dev}" | tr -c 'A-Za-z0-9._-' '_' | sed 's/_*$//')"
+[ -n "$name" ] || name="$dev"
+mp="/media/$name"; n=1
+while grep -q " $mp " /proc/mounts; do n=$((n + 1)); mp="/media/$name-$n"; done
+mkdir -p "$mp"
+
+opts="nosuid,nodev"
+case "$type" in
+    vfat|exfat) opts="$opts,uid=0,gid=100,umask=002" ;;     # writable by group 'users'
+    iso9660)    opts="$opts,ro" ;;
+esac
+if mount -t "$type" -o "$opts" "/dev/$dev" "$mp"; then
+    echo "$mp" > "$state"
+    logger -t storage "mounted $dev ($type${label:+, label $label}) at $mp"
+else
+    rmdir "$mp"
+    logger -t storage "failed to mount $dev ($type)"
+fi

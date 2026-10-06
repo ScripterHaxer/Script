@@ -8,8 +8,8 @@ Status legend: **DONE** (built + tested) · **IN PROGRESS** · **PLANNED**
 | # | Milestone | Status |
 |---|---|---|
 | M1 | Bootable minimal OS | **DONE** |
-| M2 | System foundation | PLANNED (next) |
-| M3 | Graphical foundation | PLANNED |
+| M2 | System foundation | **DONE** |
+| M3 | Graphical foundation | PLANNED (next) |
 | M4 | Gideon Compositor | PLANNED |
 | M5 | Gideon Desktop Shell | PLANNED |
 | M6 | System applications | PLANNED |
@@ -30,8 +30,11 @@ Status legend: **DONE** (built + tested) · **IN PROGRESS** · **PLANNED**
   FHS root filesystem, packs the initramfs rootless and reproducibly, and creates the hybrid
   BIOS + UEFI `build/GideonOS.iso` with GRUB.
 * `./run.sh` boots it in QEMU (window, or serial with `--serial`; `--uefi` for OVMF).
-* BusyBox init + `rc.boot`: kernel filesystems, mdev hotplug, hostname, loopback, a service hook
+* BusyBox init + `rc.boot`: kernel filesystems, mdev coldplug, hostname, loopback, a service hook
   directory, and root shells on tty1 and ttyS0.
+  *Correction (found in M2):* M1 also wrote `/proc/sys/kernel/hotplug`, but the kernel has no
+  uevent helper (`CONFIG_UEVENT_HELPER` unset), so M1 had **no** hotplug handling, only
+  devtmpfs nodes. M2 adds real hotplug through `mdev -d` (netlink).
 * `tools/check-deps.sh` detects missing host tools and prints the install command for
   apt, dnf or pacman.
 * `tests/boot_test.py`: automated BIOS + UEFI boot, 12 system checks, clean power-off.
@@ -45,28 +48,56 @@ Status legend: **DONE** (built + tested) · **IN PROGRESS** · **PLANNED**
 
 ---
 
-## M2 — System foundation — PLANNED (next)
+## M2 — System foundation — DONE
 
-Goal: a real multi-user base system with modular services, still on BusyBox init (see D3).
+**Delivered** (GideonOS 0.2.0)
+1. **Root image**: reproducible read-only squashfs (`/gideon/rootfs.squashfs`) under a tmpfs
+   overlay. The initramfs (`system/initramfs/init`) finds the medium by matching the root image
+   checksum and `switch_root`s. `gideon.verify=1` hashes the image first (boot menu entry, tested
+   with a tampered image). Rescue shell on failure or with `gideon.break=`.
+2. **Service manager** `gideon-service` (start/stop/restart/status/list/enable/disable): runsv
+   supervision with automatic restart, `requires=` dependencies with cycle detection, templated
+   instances (`dhcp@eth0`), per-service logs in `/var/log/gideon/`, boot/shutdown ordering.
+3. **Logging**: `syslog` (rotation via `logging.max_size_kb` / `logging.rotate`) + `klog`.
+4. **Networking**: `network` brings up wired interfaces (auto-detected or configured). `dhcp@IF`
+   (udhcpc) applies the lease, default route and `/run/gideon/resolv.conf`. IPv6 SLAAC by the
+   kernel. Verified: lease, route, DNS resolution, IPv6 address.
+5. **Time**: `clock` (RTC → system clock, written back at shutdown), `ntp` (servers from
+   `time.ntp_servers`), POSIX time zone from `time.timezone`.
+6. **Users**: getty + login with SHA-512 passwords. Root is refused on all terminals and reached
+   via `su`. Live user `gideon` (uid 1000, wheel). `gideon-user add|del|passwd|list`.
+7. **Storage**: removable/USB media auto-mounted at `/media/<label>` (`nosuid,nodev`, FAT/exFAT
+   writable by group `users`) on coldplug and hotplug, and unmounted on removal.
+8. **Power**: ACPI power button → clean shutdown (`acpid`).
+9. **Sessions**: login's pre-setuid hook (as root) creates `/run/user/UID` (0700) and records
+   the session. `gideon-session` is the users' login shell (exports `XDG_RUNTIME_DIR`).
+   `gideon-session --list` shows active sessions.
+10. **Configuration**: `gideon-config` with vendor defaults → `/etc/gideon` → `~/.config/gideon`.
+11. **Tests**: `./build.sh test` runs 49 checks under BIOS and UEFI, including USB hotplug via
+    the QEMU monitor and power-button shutdown.
 
-1. **Root image**: squashfs root image on the ISO. A small initramfs finds it, mounts it under a
-   tmpfs overlay and `switch_root`s. This prepares the A/B layout (D5).
-2. **Service framework**: `gideon-service` (start/stop/status, dependencies via simple
-   `requires=` headers, logs per service under `/var/log/gideon/`).
-3. **Logging**: syslogd + klogd service, log rotation.
-4. **Networking**: bring up wired interfaces with DHCP (udhcpc) and write DNS to
-   `/etc/resolv.conf`. Test: guest reaches the QEMU user-net gateway and resolves DNS.
-5. **Time**: RTC → system clock at boot, NTP service (ntpd), timezone in `/etc/gideon/time.toml`.
-6. **Users**: `getty` + `login` with real passwords; a `gideon` user (uid 1000, `wheel`);
-   `gideon-user add|del|passwd` wrapper; root login disabled on the console by default.
-7. **Storage**: detect block devices and auto-mount labelled removable media under `/media`.
-8. **Power**: ACPI power button → clean shutdown (`acpid` applet).
-9. **Session placeholder**: `gideon-session` launched for the logged-in user (still a shell).
-10. **Configuration**: `/usr/share/gideon/defaults` → `/etc/gideon` layering (D7), first
-    consumer is hostname/time/network.
+**Deviations from the plan**
+* "Service framework with `requires=` headers" became shell-fragment definitions on runit
+  (`runsv`/`svlogd`), because supervision and restart come for free and are well tested.
+* `ntpd` is a service toggled with `gideon-service enable|disable ntp` rather than a config flag.
+* Time zones are POSIX TZ strings. The zoneinfo database comes with the M3 libc/tzdata.
 
-Tests: boot test extended to log in as `gideon`, check each service's status, DHCP lease +
-DNS lookup, power-button shutdown (QEMU `system_powerdown`), user creation/deletion.
+**Upstream issues found and handled**
+* BusyBox 1.37.0 `syslogd` silently drops every `/dev/log` message unless `-L` is passed: the
+  implicit local-logging flag is set in `option_mask32`, but `syslogd_init()` returns the getopt
+  result without it. Worked around with `-L` (documented in the service file).
+* BusyBox's default password hash is DES. Set to SHA-512 in `config/busybox/gideon.config`.
+* BusyBox `mountpoint` misreports overlayfs directories as mount points. `rc.boot` uses
+  `/proc/mounts`.
+
+**Known limitations**
+* The live system keeps changes in RAM only (persistence arrives with the installer, M12).
+* All services run as root. No capability dropping until M11.
+* BusyBox is setuid root (needed for su/passwd/login). Reviewed in M11.
+* The session record directory and `/run/user` are managed without logind. Replaced in M3.
+* NTP cannot be verified in this sandbox (outbound NTP is not reachable). The daemon runs and
+  resolves servers, but synchronisation itself is untested.
+* No Wi-Fi (M9). No firmware or modules for real hardware yet (M3).
 
 ## M3 — Graphical foundation — PLANNED
 

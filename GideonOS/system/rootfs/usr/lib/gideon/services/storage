@@ -1,0 +1,20 @@
+description="Removable storage auto-mounting"
+requires="devices"
+type=oneshot
+start() {
+    mkdir -p /media /run/gideon/media
+    : > /run/gideon/storage.active
+    # Coldplug: handle devices present before this service started; hotplug
+    # events afterwards arrive through mdev (see /etc/mdev.conf).
+    for d in /sys/class/block/*; do
+        ACTION=add MDEV="${d##*/}" /usr/lib/gideon/storage-hotplug
+    done
+    return 0
+}
+stop() {
+    rm -f /run/gideon/storage.active
+    for f in /run/gideon/media/*; do
+        [ -f "$f" ] && ACTION=remove MDEV="${f##*/}" /usr/lib/gideon/storage-hotplug
+    done
+    return 0
+}

@@ -1,9 +1,12 @@
 root:x:0:
 tty:x:5:
 disk:x:6:
-wheel:x:10:
-audio:x:29:
-video:x:44:
-input:x:101:
-users:x:100:
+wheel:x:10:gideon
+dialout:x:20:
+cdrom:x:24:gideon
+audio:x:29:gideon
+video:x:44:gideon
+users:x:100:gideon
+input:x:101:gideon
+gideon:x:1000:
 nogroup:x:65534:

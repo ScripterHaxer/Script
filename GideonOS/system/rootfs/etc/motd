@@ -5,5 +5,7 @@
  | |_| | | (_| |  __/ (_) | | | || |_| |___) |
   \____|_|\__,_|\___|\___/|_| |_| \___/|____/
 
-  Milestone 1: minimal system shell. Type 'poweroff' to shut down.
+  Milestone 2: system foundation.
+  Admin: su  |  Services: gideon-service list  |  Settings: gideon-config list
+  Users: gideon-user  |  Shut down: press the power button or run poweroff as root
 

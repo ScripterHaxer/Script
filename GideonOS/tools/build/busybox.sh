@@ -4,7 +4,7 @@ source "$(dirname "$0")/../lib/common.sh"
 
 src="$SRC_DIR/busybox-$BUSYBOX_VERSION"
 out="$OUT_DIR/busybox"
-key="$(hash_inputs config/busybox config/versions.env tools/build/busybox.sh)"
+key="$(hash_inputs config/busybox tools/build/busybox.sh)-$BUSYBOX_VERSION-$BUSYBOX_SHA256"
 
 if stamp_ok busybox "$key" && [[ -x "$out" ]]; then ok "busybox up to date"; exit 0; fi
 

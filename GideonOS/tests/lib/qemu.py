@@ -6,7 +6,9 @@ wait for patterns and run shell commands. Standard library only.
 import os
 import re
 import shutil
+import socket
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -20,13 +22,20 @@ class TestFailure(Exception):
 
 
 class QemuVM:
-    def __init__(self, iso, log_path, uefi=False, mem="1G", extra=()):
+    def __init__(self, iso, log_path, uefi=False, mem="1G", extra=(), usb=()):
         qemu = shutil.which("qemu-system-x86_64")
         if not qemu:
             raise TestFailure("qemu-system-x86_64 not installed (see tools/check-deps.sh)")
+        self.tmp = tempfile.mkdtemp(prefix="gideon-qemu-")
+        self.mon_path = os.path.join(self.tmp, "monitor.sock")
         args = [qemu, "-m", mem, "-smp", "2", "-cdrom", iso, "-boot", "d",
-                "-nographic", "-no-reboot",
-                "-nic", "user,model=virtio-net-pci", "-device", "virtio-rng-pci"]
+                "-display", "none", "-serial", "stdio", "-no-reboot",
+                "-monitor", f"unix:{self.mon_path},server=on,wait=off",
+                "-nic", "user,model=virtio-net-pci", "-device", "virtio-rng-pci",
+                "-device", "qemu-xhci,id=xhci"]
+        for i, img in enumerate(usb):  # USB sticks present at boot
+            args += ["-drive", f"if=none,id=usb{i},format=raw,file={img}",
+                     "-device", f"usb-storage,bus=xhci.0,drive=usb{i},id=stick{i},removable=on"]
         if os.access("/dev/kvm", os.W_OK):
             args += ["-enable-kvm", "-cpu", "host"]
         else:
@@ -100,6 +109,45 @@ class QemuVM:
         out, m = self.expect(re.escape(e) + r":(\d+)", timeout)
         return int(m.group(1)), out[:m.start()].strip()
 
+    def monitor(self, command, timeout=10):
+        """Run a QEMU human-monitor command (e.g. system_powerdown); return its output."""
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as m:
+            m.settimeout(timeout)
+            m.connect(self.mon_path)
+            def until_prompt():
+                data = b""
+                while not data.endswith(b"(qemu) "):
+                    chunk = m.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                return data
+            until_prompt()
+            m.sendall(command.encode() + b"\n")
+            out = ANSI.sub(b"", until_prompt()).decode(errors="replace")
+        lines = out.splitlines()[1:-1]  # drop echoed command and trailing prompt
+        return "\n".join(lines).strip()
+
+    def login(self, user, password, timeout=300):
+        """Log in on the serial console; returns once a shell prompt appears."""
+        self.expect(r"login: $", timeout)
+        self.send(user + "\n")
+        self.expect(r"Password: $", 30)
+        self.send(password + "\n")
+        self.expect(r"[#$] $", 30)
+        self.run("stty -echo")  # keep transcripts to command output only
+
+    def su(self, password):
+        """Become root in the current shell session (exit() to leave)."""
+        self.send("su\n")
+        self.expect(r"Password: $", 30)
+        self.send(password + "\n")
+        self.expect(r"[#$] $", 30)
+        self.run("stty -echo")
+
+    def exit_shell(self):
+        self.send("exit\n")
+
     def wait_exit(self, timeout):
         try:
             return self.proc.wait(timeout)
@@ -111,3 +159,4 @@ class QemuVM:
             self.proc.kill()
             self.proc.wait()
         self.log.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)

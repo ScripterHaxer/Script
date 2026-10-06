@@ -1,0 +1,9 @@
+description="DHCPv4 client"
+type=daemon
+prepare() {
+    opts=""
+    [ "$(gideon-config get network.send_hostname true)" = true ] && opts="-x hostname:$(hostname)"
+    # -f foreground, -R release on exit, -b never: keep retrying in foreground.
+    exec="udhcpc -f -R -i $instance -s /usr/lib/gideon/udhcpc-script -t 5 -T 3 -A 10 $opts"
+}
+exec="false"

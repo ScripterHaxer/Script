@@ -24,10 +24,10 @@ today** versus **planned**. If the two ever disagree, this file is wrong and mus
 ├──────────────────────────────────────────────────────────────────────┤
 │ Wayland · DRM/KMS · GBM/EGL (Mesa) · libinput · libxkbcommon · libseat│  planned (M3)
 ├──────────────────────────────────────────────────────────────────────┤
-│ Platform services   session/seat · udev · D-Bus · network · audio ·  │  M2 basic, then M3+
-│                     time · logging · storage · power                 │
+│ Platform services   logging · devices · network · time · storage ·   │  IMPLEMENTED (M2, basic)
+│                     power button · users · sessions · config         │  D-Bus/audio/seat: M3+
 ├──────────────────────────────────────────────────────────────────────┤
-│ System init         BusyBox init + /usr/lib/gideon/rc.boot           │  IMPLEMENTED (M1)
+│ System init         BusyBox init + rc.boot + gideon-service (runsv)  │  IMPLEMENTED (M1–M2)
 ├──────────────────────────────────────────────────────────────────────┤
 │ Minimal userspace   static BusyBox 1.37.0                            │  IMPLEMENTED (M1)
 ├──────────────────────────────────────────────────────────────────────┤
@@ -47,15 +47,25 @@ Firmware (UEFI/BIOS) → GRUB (Gideon theme, A/B slot selection)
  → gideon-shell processes → desktop ready
 ```
 
-### Current boot flow (milestone 1, verified in QEMU)
+### Current boot flow (milestone 2, verified in QEMU under BIOS and UEFI)
 
 ```
 GRUB (build/GideonOS.iso, El Torito BIOS + EFI) → /boot/vmlinuz + /boot/initramfs.img
- → kernel unpacks initramfs as the root filesystem → /init (BusyBox init)
- → /usr/lib/gideon/rc.boot: mount proc/sys/dev/devpts/run/tmp, hostname,
-   mdev coldplug + hotplug, loopback, start /etc/gideon/services.d/*
- → root shell on tty1 and ttyS0
+ → initramfs /init (system/initramfs/init):
+     find the ISO9660 medium whose /gideon/rootfs.squashfs.sha256 matches the
+     checksum built into this initramfs (optional full hash: gideon.verify=1)
+     → mount squashfs read-only at /run/rootfs/lower
+     → tmpfs /run/rootfs/rw → overlayfs at /newroot → switch_root
+ → /sbin/init (BusyBox init) → /usr/lib/gideon/rc.boot:
+     kernel filesystems, hostname from config, mdev coldplug,
+     gideon-service boot  (devices, syslog, klog, clock, acpid, storage, network → dhcp@eth0, ntp)
+ → getty → login (root refused on terminals) → session-setup (as root: /run/user/UID)
+ → gideon-session (user's login shell; M3 turns this into the graphical session)
 ```
+
+Boot options (kernel command line): `gideon.verify=1` (hash the root image before use),
+`gideon.break=premount|preinit` (rescue shell in the initramfs), `gideon.timeout=N` (seconds to
+wait for the boot medium), `gideon.debug=1` (trace rc.boot and service startup).
 
 ---
 
@@ -108,9 +118,21 @@ Each decision lists the alternatives and why they were rejected.
   immutable image and applications are installed separately.
 
 ### D3. Init and services
-* **M1–M2**: BusyBox `init` + `/usr/lib/gideon/rc.boot`. Services are executable scripts in
-  `/etc/gideon/services.d/`, started in lexical order with `start` and stopped in reverse with
-  `stop`. This is deliberately simple and enough for logging, DHCP, time and mdev.
+* **M1–M2**: BusyBox `init` + `/usr/lib/gideon/rc.boot` + **`gideon-service`** (M2), a small
+  service manager on top of BusyBox's runit applets:
+  * Definitions are shell fragments in `/usr/lib/gideon/services/NAME`. An admin copy in
+    `/etc/gideon/services/` overrides them. Each sets `description`, `requires`, and either
+    `type=daemon` + `exec` (foreground command, optional `prepare()` to compute it from
+    configuration) or `type=oneshot` + `start()`/`stop()`.
+  * Daemons run under `runsv`, so a crashed daemon is restarted (tested). Output goes through
+    `svlogd` to `/var/log/gideon/NAME/current`. Oneshot output goes to `/var/log/gideon/NAME.log`.
+  * Templates: `dhcp@` is instantiated as `dhcp@eth0`.
+  * Dependencies start first, and cycles are detected. State changes are serialised by a lock
+    that is never inherited by daemons, and nested starts are re-entrant.
+  * `/etc/gideon/services.enabled` lists boot services. Shutdown stops them in reverse start order.
+  * Services in M2: `devices` (mdev -d, netlink hotplug), `syslog`, `klog`, `clock` (RTC),
+    `acpid` (power button), `storage` (removable media automount), `network`
+    (link up, IPv6 SLAAC by the kernel, starts `dhcp@IF`), `dhcp@` (udhcpc), `ntp`.
 * **M3 recommendation: systemd** as PID 1, with udevd, logind, journald and timesyncd. The
   graphical desktop needs seat and session management (libseat → logind), and PipeWire,
   NetworkManager, polkit, UDisks2, UPower and Flatpak all integrate with it. Avoiding it would mean
@@ -148,8 +170,12 @@ Installed disk (GPT):
   slot, never half-updated.
 * Kernel and desktop updates are just new images. Applications (gpk, Flatpak) live on DATA and
   update independently.
-* The live ISO (M1) uses the initramfs as the whole root filesystem. M2 moves to a squashfs root
-  image mounted by the initramfs, which is the first step toward this layout.
+* **Implemented for the live ISO (M2):** the OS is a read-only, reproducible squashfs image
+  (`/gideon/rootfs.squashfs`, zstd) and the initramfs puts a RAM overlay on top. Changes
+  last until reboot. The initramfs accepts only the image whose SHA-256 it was built with.
+  A full hash check before mounting is opt-in (`gideon.verify=1`, also a boot-menu entry,
+  tested against a tampered image). Always-on integrity for installed systems will be
+  dm-verity (M10/M11). Hashing the whole image on every boot does not scale.
 
 ### D6. Desktop shell: separate processes, standard protocols first
 * The compositor and the shell are **separate processes**, so a shell crash does not kill the
@@ -173,8 +199,13 @@ Installed disk (GPT):
 Three layers, highest precedence last:
 `/usr/share/gideon/defaults/` (immutable vendor defaults, part of the image) →
 `/etc/gideon/` (machine-wide) → `~/.config/gideon/` (per user).
-Files are TOML, one file per domain (`display.toml`, `input.toml` …). Tools: `gideonctl config
-get|set|reset`. Running components get live changes through the compositor IPC or D-Bus.
+One file per domain (`system.conf`, `time.conf`, `network.conf`, `logging.conf`,
+`storage.conf` …) in a flat TOML subset (`name = "string" | true | false | integer`), so the
+Rust components can parse the same files with a standard TOML parser later.
+**Implemented (M2):** `gideon-config get|set|reset|list [--user]`. Writes are atomic
+(temp file + rename), keys are validated, and `list` shows which layer each value comes from.
+Current consumers are hostname, time zone, RTC mode, NTP servers, DHCP, logging rotation and
+storage automount. Running components get live changes through compositor IPC or D-Bus (M4+).
 
 ### D8. Applications: `.gpk` + full Linux compatibility
 * A `.gpk` is a **declarative** archive: `manifest.toml` (id, version, arch, permissions,
@@ -199,8 +230,19 @@ battery, suspend and power buttons. These are existing components. GideonOS writ
 Linux mechanisms only: users/groups (desktop user is non-root, in `wheel`), file permissions,
 polkit for privileged actions, capabilities for services, namespaces + seccomp (bubblewrap) for
 apps, signed OS images and packages, and Secure Boot (shim) later. AppArmor is evaluated in M11.
-**Current state (M1):** the live image has a passwordless root shell. That is a development
-image and is not secure.
+**Current state (M2), what is actually implemented and tested:**
+* Accounts: `root` cannot log in on any terminal (empty `/etc/securetty`) and is reached with
+  `su`. The live user `gideon` (uid 1000, `wheel`) has a password. Password hashes are
+  SHA-512 crypt (BusyBox's default was DES and was changed). Live-image passwords are
+  public by design (`config/live.conf`) and must never reach an installed system.
+* `/etc/shadow` is 0600, homes are 0700, and the per-user runtime dir is created by root
+  (via `login`'s pre-setuid hook) as 0700, so it can't be squatted. Removable media is
+  mounted `nosuid,nodev`.
+* BusyBox is installed **setuid root** so `su`, `passwd` and `login` work. BusyBox drops
+  privileges for every applet not marked as needing them. This is a known trade-off of a
+  single multi-call binary and is reviewed in M11 (split setuid helpers or shadow-utils).
+* Not yet: polkit, capabilities for services (all run as root), sandboxing, signed images,
+  Secure Boot, firewall. None of these should be assumed.
 
 ---
 
@@ -212,10 +254,11 @@ GideonOS/
 ├── config/                pinned versions (versions.env), kernel + BusyBox config fragments
 ├── boot/grub/             bootloader configuration
 ├── system/rootfs/         files installed verbatim into the root filesystem
-│                          (/etc, /usr/lib/gideon …)
+│                          (/etc, /usr/lib/gideon/{rc.*,services/}, /usr/bin/gideon-*, …)
+├── system/initramfs/      the initramfs /init (finds medium, mounts image, switch_root)
 ├── tools/
 │   ├── lib/common.sh      shared build helpers (fetch + verify, stamps, reproducibility env)
-│   ├── build/*.sh         build stages: kernel, busybox, rootfs, iso
+│   ├── build/*.sh         build stages: kernel, busybox, rootfs, initramfs, iso
 │   └── check-deps.sh      host dependency detection
 ├── tests/                 automated tests (QEMU serial-console harness in tests/lib/)
 ├── docs/                  ARCHITECTURE, ROADMAP, DESIGN
@@ -238,22 +281,37 @@ components are grouped under `components/`.
 |---|---|---|---|
 | kernel | Linux tarball (SHA-256 verified), `config/kernel/*` | `build/out/vmlinuz` | fragment, version or script changes |
 | busybox | BusyBox tarball (verified), `config/busybox/*` | `build/out/busybox` | same |
-| rootfs | `system/rootfs/`, BusyBox | `build/out/initramfs.img` | always (seconds) |
-| iso | kernel, initramfs, `boot/grub` | `build/GideonOS.iso` | always (seconds) |
+| rootfs | `system/rootfs/`, BusyBox, `config/live.conf` | `build/out/rootfs.squashfs` (+ `.sha256`) | always (seconds) |
+| initramfs | `system/initramfs/init`, BusyBox, root image checksum | `build/out/initramfs.img` | always (seconds) |
+| iso | kernel, initramfs, root image, `boot/grub` | `build/GideonOS.iso` | always (seconds) |
 
 Reproducibility measures: pinned and verified sources; `SOURCE_DATE_EPOCH` (from the last git
 commit) drives `KBUILD_BUILD_TIMESTAMP`, cpio mtimes and ISO file times; fixed build
 user/host; the cpio list is sorted and every file is owned by root regardless of the builder;
-`gzip -n`. The initramfs is bit-for-bit reproducible across rebuilds (tested); a full
-from-scratch ISO comparison has not been done yet.
+`gzip -n`; mksquashfs with forced root ownership. The root image and the initramfs are
+bit-for-bit reproducible across rebuilds (tested). A full from-scratch ISO comparison has not
+been done yet.
 
-The whole build runs **without root privileges**. Device nodes and ownership are declared in
-the cpio list (`gen_init_cpio`), not created on the host.
+The whole build is designed to run **without root privileges**. Device nodes and ownership are
+declared in the cpio list (`gen_init_cpio`) and in mksquashfs actions/pseudo-definitions
+(root ownership, setuid BusyBox, user-owned home), not created on the host. (In this dev
+environment the build happens to run as root. Ownership forcing was tested with a
+non-root-owned source tree.)
 
 ## 6. Testing
 
-`tests/boot_test.py` boots the ISO in QEMU under **BIOS and UEFI (OVMF)**, drives the serial
-console, checks PID 1, boot completion, kernel identity, os-release, mounts, FHS layout,
-writable /tmp, device nodes, virtio-net detection and loopback, then requires a clean ACPI
-power-off. Serial logs go to `build/test-logs/`. Later milestones add tests to the same
-harness (services, users, gpk, compositor startup via IPC, and so on).
+`tests/boot_test.py` (`./build.sh test`) boots the ISO in QEMU under **BIOS and UEFI (OVMF)**
+with a FAT-formatted USB stick attached and drives the serial console and QEMU monitor
+through 49 checks:
+* login policy, sessions and privilege boundaries
+* overlay/squashfs root
+* all services active, crash restart, stop/start
+* syslog + klogd
+* DHCP, default route, DNS, IPv6 SLAAC
+* config layering
+* user create/login/delete
+* USB coldplug, hotplug and unplug mounts
+* ACPI power-button shutdown
+
+Assets (USB images) are created rootless with dosfstools/mtools. Serial logs go to
+`build/test-logs/`. The harness (`tests/lib/qemu.py`) is reused by later milestones.

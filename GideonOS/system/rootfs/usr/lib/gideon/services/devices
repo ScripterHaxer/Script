@@ -1,0 +1,3 @@
+description="Device manager (mdev, kernel uevents over netlink)"
+type=daemon
+exec="mdev -df -S"

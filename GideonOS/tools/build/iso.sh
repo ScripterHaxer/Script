@@ -4,14 +4,15 @@ source "$(dirname "$0")/../lib/common.sh"
 
 iso_root="$BUILD_DIR/iso-root"
 iso="$BUILD_DIR/GideonOS.iso"
-for f in vmlinuz initramfs.img; do
+for f in vmlinuz initramfs.img rootfs.squashfs rootfs.squashfs.sha256; do
     [[ -f "$OUT_DIR/$f" ]] || die "missing build/out/$f; run earlier stages first"
 done
 
 log "Staging ISO tree"
 rm -rf "$iso_root"
-mkdir -p "$iso_root/boot/grub"
+mkdir -p "$iso_root/boot/grub" "$iso_root/gideon"
 cp "$OUT_DIR/vmlinuz" "$OUT_DIR/initramfs.img" "$iso_root/boot/"
+cp "$OUT_DIR/rootfs.squashfs" "$OUT_DIR/rootfs.squashfs.sha256" "$iso_root/gideon/"
 cp "$GIDEON_ROOT/boot/grub/grub.cfg" "$iso_root/boot/grub/grub.cfg"
 printf '%s %s\n' "GideonOS" "$GIDEON_VERSION" > "$iso_root/GIDEONOS"
 find "$iso_root" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +

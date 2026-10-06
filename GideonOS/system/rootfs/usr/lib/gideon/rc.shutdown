@@ -1,9 +1,7 @@
 #!/bin/sh
-# GideonOS shutdown: stop services in reverse order, then flush and unmount.
+# GideonOS shutdown: stop services in reverse start order, flush, unmount.
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
-for svc in $(ls -r /etc/gideon/services.d/ 2>/dev/null); do
-    [ -x "/etc/gideon/services.d/$svc" ] && "/etc/gideon/services.d/$svc" stop
-done
 echo "gideon: shutting down" > /dev/kmsg
+gideon-service shutdown
 sync
 umount -a -r 2>/dev/null
