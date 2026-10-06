@@ -1,0 +1,2 @@
+# Kernel filesystems are mounted by /usr/lib/gideon/rc.boot.
+# <device> <mountpoint> <type> <options> <dump> <pass>

@@ -1,0 +1,7 @@
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+export HOME="${HOME:-/root}" TERM="${TERM:-linux}" PAGER=less EDITOR=vi
+if [ "$(id -u)" = 0 ]; then PS1='\[\e[1;36m\]\h\[\e[0m\]:\w# '; else PS1='\[\e[1;36m\]\h\[\e[0m\]:\w$ '; fi
+export PS1
+[ -r /etc/motd ] && cat /etc/motd
+for f in /etc/profile.d/*.sh; do [ -r "$f" ] && . "$f"; done
+unset f

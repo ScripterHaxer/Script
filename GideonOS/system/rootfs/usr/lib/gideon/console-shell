@@ -1,0 +1,10 @@
+#!/bin/sh
+# Spawn a login shell on the given tty, or idle if that tty has no hardware
+# behind it (e.g. no serial port on real hardware) so init does not respawn-loop.
+# init has already attached stdio and the controlling terminal to the tty.
+if [ "$(cat "/sys/class/tty/$1/type" 2>/dev/null)" = 0 ] || [ ! -c "/dev/$1" ]; then
+    exec sleep 2147483647
+fi
+export HOME=/root USER=root LOGNAME=root SHELL=/bin/sh
+cd "$HOME"
+exec /bin/sh -l

@@ -1,0 +1,10 @@
+# GideonOS inittab (BusyBox init). Format: <tty>::<action>:<process>
+# Milestone 1: boot scripts + root shells on the VGA console and serial port.
+
+::sysinit:/usr/lib/gideon/rc.boot
+
+tty1::respawn:/usr/lib/gideon/console-shell tty1
+ttyS0::respawn:/usr/lib/gideon/console-shell ttyS0
+
+::ctrlaltdel:/sbin/reboot
+::shutdown:/usr/lib/gideon/rc.shutdown
