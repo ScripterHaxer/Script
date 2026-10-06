@@ -216,6 +216,11 @@ Status legend: **DONE** (built + tested) · **IN PROGRESS** · **PLANNED**
 * Clipboard and drag and drop are tested on the host only (no wl-clipboard in the image).
 * No cursor-shape protocol: clients draw their own cursors or get the default arrow.
 * Tested in QEMU (virtio-gpu) and nested only. No physical hardware has been tested.
+* **Open issue:** in one of three full system-test runs (BIOS), the compositor did not restart
+  within 60 s of SIGTERM. The pid stayed the same, so the old process was probably slow to exit;
+  the session did come back later. It has not reproduced since (four targeted restarts took 2–3 s,
+  and a full BIOS re-run passed). The test now prints the process's kernel stack, compositor log
+  and journal when this happens, so the next occurrence can be diagnosed.
 
 ## M5 — Gideon Desktop Shell — PLANNED (next)
 
