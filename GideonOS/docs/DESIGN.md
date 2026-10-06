@@ -96,6 +96,13 @@ The accent colour is user-configurable. Contrast-checked alternatives: Teal (def
 * Resize handles are 8 lp outside the visible edge (invisible) plus corners.
 * Double-click title = maximize. Super+drag = move. Super+right-drag = resize.
 
+**Implemented in M4 (gideon-compositor):** 36 lp title bar, controls on the right, meridian
+line on the active window, close hover in `danger`, double-click maximize, Super+drag and
+Super+right-drag. **Not yet:** title text and app icon (the compositor has no font rendering
+yet), circular button shapes and glyphs (buttons are solid 20 lp squares for now), elevation
+shadows, rounded window corners, and invisible outer resize handles (edge resizing works when
+the client requests it, and through Super+right-drag).
+
 ## 7. Components (initial set)
 
 | Component | Spec summary |
@@ -122,6 +129,9 @@ The accent colour is user-configurable. Contrast-checked alternatives: Teal (def
 
 Exits are about 30 % faster than entrances. Animations are driven by output vblank and
 cancel cleanly on new input.
+
+**Implemented in M4:** a 150 ms fade-in for new windows. The other motion tokens are not
+implemented yet.
 
 ## 9. Keyboard model (defaults)
 

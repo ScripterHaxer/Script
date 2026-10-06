@@ -45,8 +45,9 @@ while IFS= read -r line; do
 done < "$defconfig"
 (( bad == 0 )) || die "Buildroot defconfig not fully applied"
 
-# Our own packages build from the working tree: always rebuild them.
-targets=(gideon-gfx-probe-dirclean ${GIDEON_BR_TARGETS:-})
+# Our own packages build from the working tree: always re-sync and rebuild
+# them (`-rebuild` re-runs the rsync of local sources; cargo stays incremental).
+targets=(gideon-gfx-probe-dirclean gideon-compositor-rebuild ${GIDEON_BR_TARGETS:-})
 log "Building userspace with Buildroot (log: build/buildroot.log)"
 start=$SECONDS
 make -C "$br_out" "${targets[@]}" > "$BUILD_DIR/buildroot.log" 2>&1 \

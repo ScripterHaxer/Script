@@ -19,8 +19,8 @@ today** versus **planned**. If the two ever disagree, this file is wrong and mus
 │ Gideon Desktop Shell         panel · launcher · notifications · lock │  planned (M5)
 │   (separate processes; Wayland layer-shell + gideon-shell protocol)  │
 ├──────────────────────────────────────────────────────────────────────┤
-│ Gideon Compositor            Rust + Smithay; window mgmt, input,     │  planned (M4)
-│                              outputs, decorations, IPC               │  (interim: Weston 14, M3)
+│ Gideon Compositor            Rust + Smithay; window mgmt, input,     │  IMPLEMENTED (M4)
+│                              outputs, decorations, IPC               │  (replaced Weston)
 ├──────────────────────────────────────────────────────────────────────┤
 │ Wayland · DRM/KMS · GBM/EGL (Mesa) · libinput · libxkbcommon · libseat│  IMPLEMENTED (M3)
 ├──────────────────────────────────────────────────────────────────────┤
@@ -49,7 +49,7 @@ Firmware (UEFI/BIOS) → GRUB (Gideon theme, A/B slot selection)
  → gideon-shell processes → desktop ready
 ```
 
-### Current boot flow (milestone 3, verified in QEMU under BIOS and UEFI)
+### Current boot flow (milestone 4, verified in QEMU under BIOS and UEFI)
 
 ```
 GRUB (build/GideonOS.iso, El Torito BIOS + EFI) → /boot/vmlinuz + /boot/initramfs.img
@@ -63,8 +63,9 @@ GRUB (build/GideonOS.iso, El Torito BIOS + EFI) → /boot/vmlinuz + /boot/initra
      → udevd (devices, modules, firmware; removable media → gideon-automount@)
      → journald, logind, networkd, resolved, timesyncd
  → getty@tty1 (autologin, live image) → login (PAM: pam_systemd → logind session)
- → gideon-session → graphical-session → Weston (DRM/KMS, libinput, libseat→logind)
- → desktop (interim shell) on every connected output
+ → gideon-session → graphical-session → gideon-compositor --backend udev
+     (DRM/KMS + pixman, libinput, libseat→logind; IPC socket in /run/user/1000)
+ → background on every connected output; Super+Enter opens the terminal (foot)
  Serial console: serial-getty@ttyS0 → login → gideon-session → text shell
 ```
 
@@ -193,19 +194,32 @@ Each decision lists the alternatives and why they were rejected.
   (would not be ours).
 * Development backend: Smithay's winit/nested backend lets the compositor run inside a window
   on a dev host. KMS backend in QEMU via `virtio-gpu`/`bochs` (already enabled in the kernel).
-* **M3 interim: Weston 14** (DRM backend, desktop shell) validates the whole stack until
-  gideon-compositor exists. It is launched by `/usr/lib/gideon/graphical-session` with a
-  `weston.ini` generated from `gideon-config` (`display.mode`, `display.scale`,
-  `display.renderer`, `display.background`, `input.keyboard_layout`, one `[output]` per
-  connected connector). If it fails within 15 s, the user gets a text shell and the log.
-  It is not the GideonOS desktop, and it is removed in M4.
+* **Implemented (M4): `gideon-compositor`** (`components/compositor`, Smithay 0.7, Rust 1.88
+  in Buildroot). It replaced the M3 interim Weston, which is no longer in the image.
+  * Backends: **udev** (production): libseat session (logind), udev hotplug, libinput,
+    DRM/KMS with one CRTC per connector, rendered by **pixman into DRM dumb buffers**, page flips
+    paced by vblank. **winit** (cargo feature, development): nested GLES window on a host.
+  * Protocols: wl_compositor, wl_subcompositor, xdg-shell, xdg-decoration (server side is
+    forced), wl_shm, wl_seat, wl_output + xdg-output, wl_data_device (clipboard, drag and
+    drop), primary selection, fractional-scale, viewporter.
+  * Window management (`wm.rs`): placement, focus/raise, server-side decorations (title bar,
+    close/maximize/minimize buttons, meridian accent line), move/resize (title-bar drag,
+    client-requested, Super+drag), maximize, minimize, fullscreen, left/right tiling,
+    9 workspaces, window cycling. Shortcuts as in DESIGN §9.
+  * Outputs: laid out left to right; mode and scale from `display.mode`/`display.scale` at
+    start, and changeable live over IPC. VT switching via logind.
+  * Rendering: damage-tracked, 150 ms fade-in for new windows, software cursor, screenshots
+    (Print key → `~/Pictures/*.png`, or IPC `screenshot`).
+  * `graphical-session` starts the compositor. If it fails within 15 s with a real error (not
+    a signal), the user gets a text shell and the log. SIGTERM exits cleanly with status 0.
 * **Mesa 26.0** drivers in the image: softpipe (CPU), virgl (VMs), nouveau, svga. **iris,
   crocus, radeonsi and llvmpipe need LLVM**, because Mesa 26 compiles their OpenCL-C kernels with
   it. LLVM is deferred for build cost (hours on this host), so modern Intel and AMD GPUs
   currently have KMS and display, but no hardware GL. Buildroot 2026.02 does not mark crocus
   as needing LLVM; Mesa's configure rejects it, and we drop it.
-* Renderer policy: the compositor uses **pixman** (CPU) by default. `display.renderer = "gl"`
-  opts into GPU composition. Clients can still use EGL/GLES (tested through Mesa on Wayland).
+* Renderer policy: the compositor composes on the **CPU (pixman)**, so it works on every GPU
+  and in VMs. GPU composition (GBM + GLES) is a later optimisation and is not implemented
+  yet. Clients can still use EGL/GLES (tested through Mesa on Wayland).
 
 ### D5. Filesystem and update model: image-based A/B system
 ```
@@ -239,7 +253,12 @@ Installed disk (GPT):
   `ext-session-lock`, `xdg-activation`, `ext-image-copy-capture`). Where nothing standard
   fits, a private `gideon-shell-v1` Wayland protocol is used. Non-display control (settings
   reload, scripting, tests) goes through a JSON-over-Unix-socket IPC at
-  `$XDG_RUNTIME_DIR/gideon-compositor.sock`.
+  `$XDG_RUNTIME_DIR/gideon-compositor.sock`. **Implemented (M4):** one JSON request per
+  connection (`{"cmd":…,"args":[…]}`), with the CLI client `gideon-compositor msg CMD ARGS`.
+  Commands: version, outputs, windows, workspaces, pointer, workspace, focus, close,
+  maximize, minimize, restore, fullscreen, tile-left/right, floating, move, resize,
+  to-workspace, action, spawn, set-mode, set-scale, screenshot, reload-config, quit.
+  The layer-shell and foreign-toplevel protocols are M5 work.
 * **UI toolkit:** recommendation is Rust + [iced](https://iced.rs) wrapped in our own `gideon-ui`
   crate, which holds the design tokens from `docs/DESIGN.md` and shared widgets, so the
   shell and every system app look the same. A one-week prototype at M5 start (panel + launcher)
@@ -257,10 +276,11 @@ Rust components can parse the same files with a standard TOML parser later.
 (temp file + rename), keys are validated, and `list` shows which layer each value comes from.
 Current consumers (M3): hostname, time zone (zoneinfo names), network (DHCP, interfaces,
 send hostname → systemd-networkd), NTP servers (→ timesyncd), storage automount, display
-mode/scale/renderer/background and keyboard layout (graphical session), and session graphical
+mode/scale/background, keyboard layout and terminal (read by gideon-compositor), and session graphical
 mode and autologin. `gideon-config apply` (root) re-applies system settings live and restarts
 only the affected services. Display settings apply when the graphical session starts.
-Running components get live changes through compositor IPC or D-Bus (M4+).
+The compositor re-reads its settings on IPC `reload-config`. Other running components get
+live changes through IPC or D-Bus later.
 
 ### D8. Applications: `.gpk` + full Linux compatibility
 * A `.gpk` is a **declarative** archive: `manifest.toml` (id, version, arch, permissions,
@@ -318,6 +338,7 @@ GideonOS/
 │                          (/etc, /usr/lib/gideon/{rc.*,services/}, /usr/bin/gideon-*, …)
 ├── system/initramfs/      the initramfs /init (finds medium, mounts image, switch_root)
 ├── system/buildroot/      BR2_EXTERNAL tree: defconfig, GideonOS packages, image hooks
+├── components/compositor/ gideon-compositor (Rust + Smithay; Cargo.lock pinned, vendored at build)
 ├── components/gfx-probe/  Wayland test client (wl_shm + EGL/GLES, input reporting)
 ├── tools/
 │   ├── lib/common.sh      shared build helpers (fetch + verify, stamps, reproducibility env)
@@ -329,7 +350,7 @@ GideonOS/
 ```
 
 Planned and created only when work on them begins (so there are no placeholder directories):
-`components/compositor`, `components/desktop`, `components/apps`, `components/ui` (gideon-ui),
+`components/desktop`, `components/apps`, `components/ui` (gideon-ui),
 `components/gpk`, `components/update`, `components/installer`, `kernel/patches`.
 
 The suggested top-level `kernel/` and `userspace/` directories became `config/kernel` and
@@ -367,14 +388,18 @@ as root, so a fully unprivileged build has not been exercised since Buildroot wa
 
 `tests/boot_test.py` (`./build.sh test`) boots the ISO in QEMU under **BIOS and UEFI (OVMF)**
 with a two-head virtio GPU, a USB tablet and a FAT USB stick. It drives the serial console
-and the QEMU monitor through 72 checks per firmware:
+the QEMU monitor and QMP through 87 checks per firmware:
 * login policy, logind sessions and privilege boundaries
 * systemd state (no failed units), overlay/squashfs root, modules and firmware
 * graphics:
-  * compositor on DRM/KMS; libinput keyboard and pointer
-  * background and panel pixels, client frames via wl_shm and **EGL/GLES (Mesa)**
-  * **keyboard and pointer routing** proven by the client re-rendering
-  * **two displays**; **mode + scale change** through `gideon-config`
+  * gideon-compositor on DRM/KMS (IPC `version`), session locale, libinput keyboard and pointer
+  * background pixels, client frames via wl_shm and **EGL/GLES (Mesa)**, decorations
+  * **keyboard and pointer routing** proven by the client re-rendering; absolute pointer
+    clicks through QMP `input-send-event`
+  * window management: title-bar drag, maximize/tile/fullscreen/workspace shortcuts,
+    foot via Super+Enter, Print screenshot PNG
+  * **two displays**; **mode + scale change** over IPC and through `gideon-config`;
+    VT switch to tty2 and back
 * services: active, crash restart, stop/start; journal (user + kernel + logins)
 * DHCP, route, resolved DNS, IPv6 SLAAC
 * `gideon-config apply` (hostname, time zone)
@@ -388,3 +413,9 @@ when a UI reports them, so multi-display runs start QEMU's GTK UI on a private X
 (zoom-to-fit, so the guest's chosen mode is not overridden by the window size). Without Xvfb
 those checks are reported as SKIP, never as passed. Assets are created rootless, and serial
 logs go to `build/test-logs/`.
+
+`tests/compositor_test.py` runs the compositor nested (winit backend) on a private Xvfb with
+xdotool and wl-clipboard: 33 checks covering protocols, decorations, focus, move/resize,
+maximize/minimize/fullscreen, tiling, workspaces, shortcuts, clipboard, screenshots and IPC
+errors. It needs `cargo build --release --features winit` and `make -C components/gfx-probe`
+first, and runs in about a minute. `cargo test` covers config parsing.

@@ -11,6 +11,11 @@ fi
 [ $# -gt 0 ] && exec /bin/sh "$@"
 
 export SHELL=/bin/sh XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+# System locale for every session type (the graphical path never reads /etc/profile).
+if [ -z "${LANG:-}" ] && [ -r /etc/locale.conf ]; then
+    . /etc/locale.conf
+    export LANG
+fi
 case "$(tty 2>/dev/null)" in
     /dev/tty[0-9]*)
         if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -n "${XDG_RUNTIME_DIR:-}" ] &&

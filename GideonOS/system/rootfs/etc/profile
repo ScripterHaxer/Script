@@ -2,6 +2,8 @@
 # check for root themselves.
 export PATH=/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin
 export PAGER=less EDITOR=vi
+# Locale generated into the image (BR2_GENERATE_LOCALE); system default in /etc/locale.conf.
+export LANG="${LANG:-en_US.UTF-8}"
 if [ "$(id -u)" = 0 ]; then PS1='\[\e[1;31m\]\u@\h\[\e[0m\]:\w# '; else PS1='\[\e[1;36m\]\u@\h\[\e[0m\]:\w$ '; fi
 export PS1
 for f in /etc/profile.d/*.sh; do [ -r "$f" ] && . "$f"; done

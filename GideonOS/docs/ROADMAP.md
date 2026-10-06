@@ -10,8 +10,8 @@ Status legend: **DONE** (built + tested) · **IN PROGRESS** · **PLANNED**
 | M1 | Bootable minimal OS | **DONE** |
 | M2 | System foundation | **DONE** |
 | M3 | Graphical foundation | **DONE** |
-| M4 | Gideon Compositor | PLANNED (next) |
-| M5 | Gideon Desktop Shell | PLANNED |
+| M4 | Gideon Compositor | **DONE** |
+| M5 | Gideon Desktop Shell | PLANNED (next) |
 | M6 | System applications | PLANNED |
 | M7 | Application packaging (`gpk`) | PLANNED |
 | M8 | Software compatibility | PLANNED |
@@ -155,23 +155,69 @@ Status legend: **DONE** (built + tested) · **IN PROGRESS** · **PLANNED**
 * Root image reproducibility is only partial: a from-scratch build and a later incremental
   rebuild produced different images (ARCHITECTURE §5). Investigate before M10.
 
-## M4 — Gideon Compositor — PLANNED
+## M4 — Gideon Compositor — DONE
 
-`components/compositor/` (Rust + Smithay). Steps in order, each committed when tested:
-1. Start on winit (nested) and KMS backends, show a solid Gideon background.
-2. xdg-shell: launch one client and render it.
-3. Keyboard + pointer input routing and focus.
-4. Interactive move. 5. Resize. 6. Multiple windows and stacking.
-7. Maximize, minimize, fullscreen; server-side decorations (xdg-decoration) in Gideon style.
-8. Workspaces. 9. Multiple outputs, output configuration, fractional scaling.
-10. Clipboard and drag-and-drop (data-device), screenshots (image-copy-capture),
-    animations, vsync/presentation-time, keybinding config.
-11. JSON IPC socket and a headless backend for automated tests.
+**Delivered** (GideonOS 0.4.0)
+1. **`gideon-compositor`** (`components/compositor/`, Rust + Smithay 0.7), built in Buildroot
+   from a pinned `Cargo.lock` (crates vendored offline at build time). It replaces Weston, which
+   is no longer in the image. Steps were built in the planned order: background → client →
+   rendering → input → move → resize → multiple windows → workspaces → outputs → polish.
+2. **Backends:** udev/DRM/KMS (libseat → logind, udev hotplug, libinput, pixman into dumb
+   buffers, vblank-paced page flips, VT switching) and a nested winit backend for development.
+3. **Window management:** server-side decorations in Gideon style (title bar, close/maximize/
+   minimize, meridian accent), focus and stacking, move (title-bar drag, Super+drag, client
+   request), resize (edges via client request, Super+right-drag), double-click maximize,
+   maximize, minimize, fullscreen, left/right tiling, 9 workspaces, window cycling.
+4. **Shortcuts** (DESIGN §9): Super+Enter terminal, Super+Q / Alt+F4 close, Super+Up/Down,
+   Super+Left/Right tile, Super+F fullscreen, Super+1–9, Super+Shift+1–9, Super+Ctrl+Left/Right,
+   Super+Tab / Alt+Tab, Print screenshot, Ctrl+Alt+F1–F12 VT switch, Super+Shift+Escape quit.
+5. **Outputs:** several displays laid out left to right, mode and fractional scale from
+   `gideon-config` at start and changeable live over IPC. Clients get fractional-scale and
+   viewporter.
+6. **Clipboard and drag and drop** (wl_data_device, primary selection), **screenshots** (Print
+   key → `~/Pictures`, IPC `screenshot`), 150 ms fade-in for new windows, software cursor.
+7. **IPC:** JSON over `$XDG_RUNTIME_DIR/gideon-compositor.sock` with the
+   `gideon-compositor msg` client (ARCHITECTURE D6).
+8. **foot** is the terminal (`session.terminal`), started with Super+Enter.
+9. **Tests:** `tests/compositor_test.py`, 33 host checks of the nested compositor on Xvfb, and
+   the system test at 87 checks per firmware (BIOS + UEFI). The system test adds decorations,
+   absolute pointer clicks over QMP, title-bar drag, shortcuts, foot, Print, live mode/scale
+   changes, two displays and VT switching on the real DRM backend.
 
-Replaces the M3 interim compositor (Weston). The M3 test harness carries over: compositor startup,
-pixel checks, input routing via the QEMU monitor, multi-head via Xvfb, and gfx-probe as the client.
+**Deviations from the plan**
+* No separate headless backend. Automated tests use the nested backend on Xvfb (host) and the
+  real DRM backend in QEMU, which covers more than a headless backend would.
+* Screenshots use an internal readback (IPC and Print key), not `ext-image-copy-capture`.
+  Clients cannot request screenshots yet.
+* `presentation-time` is not implemented. Frames are paced by vblank and frame callbacks.
+* Keybindings are fixed (DESIGN §9), not configurable yet.
 
-## M5 — Gideon Desktop Shell — PLANNED
+**Bugs found by the tests and fixed**
+* The configuration root defaulted to an empty path, so the compositor never read
+  `/usr/share/gideon` on the real system (only on the host). Fixed, plus a regression test.
+* The graphical session had no `LANG` (foot warned about the locale). `gideon-session` now
+  reads `/etc/locale.conf`.
+* SIGTERM ended the compositor with status 143 and triggered the fallback shell. The
+  compositor now handles SIGTERM/SIGINT and exits 0, and the fallback ignores signal exits.
+* Pressing a maximized window's title bar restored it at once and broke double-click. A
+  maximized window now detaches only after 8 px of motion.
+* Buildroot does not resync local package sources, so tests ran an old binary. `rootfs.sh`
+  now rebuilds the compositor package every time.
+* QEMU 8.2 aborts on `input-send-event` with a `device` argument for the virtio console. The
+  harness omits it.
+
+**Known limitations**
+* No title text in the title bar yet (no font rendering in the compositor; comes with gideon-ui).
+* CPU (pixman) composition only. GPU composition (GLES) is a later optimisation.
+* Popup grabs (menus closing on outside click) are not implemented.
+* No layer-shell, foreign-toplevel or session-lock yet (needed for M5).
+* Absolute pointer devices (tablets, the QEMU USB tablet) map to the first output.
+* No XWayland: X11-only apps do not run (M8).
+* Clipboard and drag and drop are tested on the host only (no wl-clipboard in the image).
+* No cursor-shape protocol: clients draw their own cursors or get the default arrow.
+* Tested in QEMU (virtio-gpu) and nested only. No physical hardware has been tested.
+
+## M5 — Gideon Desktop Shell — PLANNED (next)
 
 `components/desktop/` + `components/ui/` (gideon-ui). Start with a toolkit prototype (D6).
 Order: panel with clock + task list → launcher/start menu with app search → notifications →

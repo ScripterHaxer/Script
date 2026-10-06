@@ -1,0 +1,30 @@
+[package]
+name = "gideon-compositor"
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.85"
+description = "The GideonOS Wayland compositor"
+publish = false
+
+[features]
+default = []
+# Nested development backend (runs in a window on X11/Wayland).
+winit = ["smithay/backend_winit"]
+
+[dependencies]
+smithay = { version = "0.7", default-features = false, features = [
+    "wayland_frontend", "desktop",
+    "backend_drm", "backend_gbm", "backend_libinput",
+    "backend_session_libseat", "backend_udev",
+    "renderer_gl", "renderer_pixman", "use_system_lib",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"
+png = "0.17"
+# Same version smithay uses; "signals" for clean shutdown on SIGTERM/SIGINT.
+calloop = { version = "0.14", features = ["signals"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

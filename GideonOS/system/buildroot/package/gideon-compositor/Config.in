@@ -1,0 +1,18 @@
+config BR2_PACKAGE_GIDEON_COMPOSITOR
+	bool "gideon-compositor"
+	depends on BR2_PACKAGE_HOST_RUSTC_TARGET_ARCH_SUPPORTS
+	depends on BR2_PACKAGE_SYSTEMD # udev, logind (libseat backend)
+	depends on BR2_PACKAGE_MESA3D # libgbm
+	select BR2_PACKAGE_HOST_RUSTC
+	select BR2_PACKAGE_WAYLAND
+	select BR2_PACKAGE_LIBINPUT
+	select BR2_PACKAGE_LIBXKBCOMMON
+	select BR2_PACKAGE_XKEYBOARD_CONFIG
+	select BR2_PACKAGE_PIXMAN
+	select BR2_PACKAGE_SEATD
+	select BR2_PACKAGE_LIBDRM
+	select BR2_PACKAGE_MESA3D_GBM
+	help
+	  The GideonOS Wayland compositor (components/compositor):
+	  DRM/KMS output, libinput input, window management,
+	  workspaces and an IPC socket for the desktop shell.

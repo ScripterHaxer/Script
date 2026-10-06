@@ -5,7 +5,7 @@
  | |_| | | (_| |  __/ (_) | | | || |_| |___) |
   \____|_|\__,_|\___|\___/|_| |_| \___/|____/
 
-  Milestone 3: graphical foundation (interim compositor: Weston).
+  Milestone 4: Gideon Compositor.   Super+Enter: terminal   Super+1..9: workspaces
   Admin: su  |  Services: systemctl  |  Logs: journalctl  |  Settings: gideon-config
   Users: gideon-user  |  Shut down: power button or `su -c poweroff`
 

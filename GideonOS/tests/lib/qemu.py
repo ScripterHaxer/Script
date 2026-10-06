@@ -3,6 +3,7 @@
 Boots an ISO headless, exposes the serial console as a stream, and lets a test
 wait for patterns and run shell commands. Standard library only.
 """
+import json
 import os
 import re
 import shutil
@@ -80,14 +81,16 @@ class QemuVM:
                     env["DISPLAY"] = ":" + f.readline().strip()
                 display, self.multihead = "gtk,show-tabs=on,zoom-to-fit=on", True
         self.mon_path = os.path.join(self.tmp, "monitor.sock")
+        self.qmp_path = os.path.join(self.tmp, "qmp.sock")
         args = [qemu, "-m", mem, "-smp", "2", "-cdrom", iso, "-boot", "d",
                 "-display", display, "-serial", "stdio", "-no-reboot",
                 "-monitor", f"unix:{self.mon_path},server=on,wait=off",
+                "-qmp", f"unix:{self.qmp_path},server=on,wait=off",
                 "-nic", "user,model=virtio-net-pci", "-device", "virtio-rng-pci",
                 "-device", "qemu-xhci,id=xhci",
                 # Display: virtio GPU (KMS) with `outputs` heads; absolute pointer.
                 "-vga", "none", "-device", f"virtio-vga,max_outputs={outputs},id=gpu",
-                "-device", "usb-tablet,bus=xhci.0"]
+                "-device", "usb-tablet,bus=xhci.0,id=tablet"]
         for i, img in enumerate(usb):  # USB sticks present at boot
             args += ["-drive", f"if=none,id=usb{i},format=raw,file={img}",
                      "-device", f"usb-storage,bus=xhci.0,drive=usb{i},id=stick{i},removable=on"]
@@ -182,6 +185,39 @@ class QemuVM:
             out = ANSI.sub(b"", until_prompt()).decode(errors="replace")
         lines = out.splitlines()[1:-1]  # drop echoed command and trailing prompt
         return "\n".join(lines).strip()
+
+    def qmp(self, command, arguments=None, timeout=10):
+        """Run one QMP command (fresh connection per call)."""
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as q:
+            q.settimeout(timeout)
+            q.connect(self.qmp_path)
+            f = q.makefile("rw")
+            f.readline()  # greeting
+            for cmd in ({"execute": "qmp_capabilities"}, {"execute": command, "arguments": arguments or {}}):
+                f.write(json.dumps(cmd) + "\n")
+                f.flush()
+                while True:
+                    reply = json.loads(f.readline())
+                    if "return" in reply or "error" in reply:
+                        break
+            if "error" in reply:
+                raise TestFailure(f"QMP {command}: {reply['error']}")
+            return reply["return"]
+
+    def pointer_to(self, x, y, width, height, head=0):
+        """Absolute pointer position in pixels of a head of `width`x`height`
+        (QEMU's monitor `mouse_move` is relative only, so use QMP)."""
+        scale = 0x7FFF
+        # No "device": QEMU 8.2 aborts resolving it against a text console;
+        # absolute events go to the absolute handler (the USB tablet) anyway.
+        self.qmp("input-send-event", {"events": [
+            {"type": "abs", "data": {"axis": "x", "value": int(x * scale / max(width - 1, 1))}},
+            {"type": "abs", "data": {"axis": "y", "value": int(y * scale / max(height - 1, 1))}},
+        ]})
+
+    def pointer_button(self, down, button="left"):
+        self.qmp("input-send-event", {"events": [
+            {"type": "btn", "data": {"down": down, "button": button}}]})
 
     def screendump(self, head=0):
         """Capture display head `head`; returns Image(width, height, pixel(x, y) -> (r, g, b))."""

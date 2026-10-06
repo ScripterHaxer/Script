@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GideonOS system test (milestones 1-3).
+"""GideonOS system test (milestones 1-4).
 
 Boots build/GideonOS.iso in QEMU (BIOS and/or UEFI) with a two-head virtio GPU,
 a USB tablet and a USB stick, then drives the serial console and QEMU monitor
@@ -11,6 +11,7 @@ scale changes) and power-button shutdown.
     tests/boot_test.py [--bios] [--uefi] [--iso PATH] [--timeout SECONDS]
 """
 import argparse
+import json
 import os
 import sys
 import time
@@ -24,7 +25,6 @@ LIVE_PW = "gideon"   # config/live.conf
 CORE_UNITS = ("systemd-journald systemd-udevd systemd-logind systemd-networkd systemd-resolved "
               "systemd-timesyncd gideon-config-apply getty@tty1")
 BG, TEAL, AMBER, RED = "0f1216", "3db8c6", "e8b04b", "f06a6a"   # docs/DESIGN.md tokens
-PROBE_LOG = "/tmp/probe.log"
 IFV = "IF=$(ls /sys/class/net | grep -vx lo | head -1); "
 WL = "export XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=$(cd /run/user/1000 && ls wayland-? | head -1)"
 
@@ -76,94 +76,201 @@ def wait_screen(vm, rgb, head=0, seconds=30):
         time.sleep(1)
 
 
-def start_probe(vm, args):
-    vm.run(f"pkill -x gideon-gfx-probe; sleep 1; ({WL}; gideon-gfx-probe {args} > {PROBE_LOG} 2>&1 &)")
+MSG = "XDG_RUNTIME_DIR=/run/user/1000 gideon-compositor msg"
+BAR_FOCUSED = "1f242c"
+
+
+def ipc(vm, *args):
+    """Run a compositor IPC command in the guest; returns the parsed JSON result."""
+    status, out = vm.run(f"{MSG} {' '.join(str(a) for a in args)}", 60)
+    if status != 0:
+        raise TestFailure(f"ipc {args} failed: {out}")
+    return json.loads(out) if out.strip() else None
+
+
+def wait_until(fn, seconds, what):
+    deadline = time.monotonic() + seconds
+    while True:
+        value = fn()
+        if value:
+            return value
+        if time.monotonic() > deadline:
+            raise TestFailure(f"timed out waiting for {what}")
+        time.sleep(1)
+
+
+def start_probe(vm, args, log):
+    vm.run(f"({WL}; gideon-gfx-probe {args} > {log} 2>&1 &)")
+
+
+SCREEN = {"w": 1280, "h": 800}   # head 0 size, updated when the test changes mode
+
+
+def point(vm, x, y):
+    vm.pointer_to(x, y, SCREEN["w"], SCREEN["h"])
+    time.sleep(0.3)
+
+
+def click(vm, x, y):
+    point(vm, x, y)
+    vm.pointer_button(True)
+    time.sleep(0.2)
+    vm.pointer_button(False)
+    time.sleep(0.3)
 
 
 def graphics_checks(t, vm):
-    t.check("graphical session (compositor) running for the live user on tty1",
-            wait_for("pgrep -x weston >/dev/null", 90) + " && stat -c %U /proc/$(pgrep -x weston)", lambda o: o.endswith("gideon"), 120)
-    t.check("Wayland socket in the user's runtime dir", "ls /run/user/1000/ | grep -x 'wayland-[0-9]'", lambda o: o.startswith("wayland-"))
-    t.check("compositor drives the display through DRM/KMS",
-            "grep -ciE 'drm backend|DRM: head|DRM: supports' /run/user/1000/gideon/compositor.log", lambda o: int(o) > 0)
-    t.check("libinput sees keyboard and pointer",
-            "grep -E 'device is a (keyboard|pointer)' /run/user/1000/gideon/compositor.log | sed 's/.*device is a //' | sort -u | tr '\\n' ' '",
-            lambda o: o.split() == ["keyboard", "pointer"])
+    t.check("gideon-compositor running for the live user on tty1",
+            wait_for("pidof gideon-compositor >/dev/null && [ -S /run/user/1000/gideon-compositor.sock ]", 120)
+            + " && stat -c %U /proc/$(pidof gideon-compositor)", lambda o: o.endswith("gideon"), 150)
+    t.check("compositor reports the DRM/KMS backend", f"{MSG} version", lambda o: '"udev"' in o)
+    t.check("graphical session has the system locale",
+            "tr '\\0' '\\n' < /proc/$(pidof gideon-compositor)/environ | grep '^LANG='", lambda o: o == "LANG=en_US.UTF-8")
+    t.check("compositor log: KMS output brought up", "grep -c 'output connected' /run/user/1000/gideon/compositor.log",
+            lambda o: int(o) >= 1)
 
-    img = wait_screen(vm, BG)
-    t.expect_true("desktop background drawn in GideonOS colour (#0f1216)", img.matches(*centre(img), BG),
-                  f"centre pixel {img.pixel(*centre(img))} size {img.width}x{img.height}")
-    t.expect_true("panel drawn at the bottom of the screen", not img.matches(img.width // 2, img.height - 8, BG),
-                  f"bottom pixel {img.pixel(img.width // 2, img.height - 8)}")
+    outputs = ipc(vm, "outputs")
+    name = outputs[0]["name"]
+    t.expect_true("outputs named after their connectors", name.startswith("Virtual-"), f"{outputs}")
+    # Runtime mode change to a desktop-sized mode the (virtual) monitor offers;
+    # under QEMU's GTK UI the preferred mode follows the small window size.
+    offered = [m.split("@")[0] for m in outputs[0]["modes"]]
+    mode = next((m for m in ("1280x800", "1280x720", "1280x1024", "1024x768") if m in offered), None)
+    t.expect_true("display offers a desktop-sized mode", mode is not None, f"{offered}")
+    W, H = map(int, (mode or "1024x768").split("x"))
+    SCREEN.update(w=W, h=H)
+    t.check(f"runtime mode change to {mode}", f"{MSG} set-mode {name} {mode}", lambda o: True)
+    img = wait_until(lambda: (lambda i: i if (i.width, i.height) == (W, H) else None)(vm.screendump(0)), 30, f"{mode} scanout")
+    t.expect_true(f"display scans out {mode} after the change", (img.width, img.height) == (W, H))
+    t.expect_true("desktop background drawn in GideonOS colour", img.matches(20, 20, BG), f"{img.pixel(20, 20)}")
 
-    # --- client rendering (CPU / wl_shm) -----------------------------------
-    start_probe(vm, "--fullscreen")
-    t.check("test client connects and draws (wl_shm)",
-            wait_for(f"grep -q 'drawn color={TEAL}' {PROBE_LOG}", 30) + f" && cat {PROBE_LOG}", lambda o: "renderer=shm" in o, 60)
-    img = wait_screen(vm, TEAL)
-    t.expect_true("client frame reaches the screen (pixel-exact colour)", img.matches(*centre(img), TEAL),
-                  f"centre pixel {img.pixel(*centre(img))}")
-    outputs = vm.run(f"grep -o 'outputs=[0-9]*' {PROBE_LOG}")[1]
+    # --- first client (CPU / wl_shm) ------------------------------------------
+    start_probe(vm, "", "/tmp/probe1.log")
+    w1 = wait_until(lambda: next(iter(ipc(vm, "windows")), None), 30, "first window")
+    t.check("client connects, sees keyboard+pointer and draws",
+            wait_for(f"grep -q 'drawn color={TEAL}' /tmp/probe1.log", 20) + " && grep seat /tmp/probe1.log | tail -1",
+            lambda o: "keyboard=1" in o and "pointer=1" in o, 40)
+    time.sleep(1)
+    img = vm.screendump(0)
+    cx, cy = w1["x"] + w1["width"] // 2, w1["y"] + w1["height"] // 2
+    t.expect_true("client frame scanned out (pixel-exact)", img.matches(cx, cy, TEAL), f"{img.pixel(cx, cy)} at {cx},{cy}")
+    t.expect_true("server-side title bar above the client", img.matches(w1["x"] + 10, w1["y"] - 18, BAR_FOCUSED),
+                  f"{img.pixel(w1['x'] + 10, w1['y'] - 18)}")
+    t.expect_true("meridian accent line marks the focused window", img.matches(w1["x"] + 10, w1["y"] - 36, TEAL),
+                  f"{img.pixel(w1['x'] + 10, w1['y'] - 36)}")
 
-    # --- input routing -------------------------------------------------------
-    vm.run(wait_for(f"grep -q 'keyboard focus' {PROBE_LOG}", 15))
+    # --- input routing ----------------------------------------------------------
     vm.monitor("sendkey a")
-    t.check("keyboard input routed to the focused client",
-            wait_for(f"grep -q 'key 30' {PROBE_LOG}", 15) + " && echo got", lambda o: o.endswith("got"), 30)
-    img = wait_screen(vm, AMBER)
-    t.expect_true("client re-rendered after the key press", img.matches(*centre(img), AMBER),
-                  f"centre pixel {img.pixel(*centre(img))}")
-    vm.monitor(f"mouse_move {img.width // 2} {img.height // 2}")
-    vm.monitor("mouse_button 1")
-    vm.monitor("mouse_button 0")
-    t.check("pointer button routed to the client",
-            wait_for(f"grep -q 'button 272' {PROBE_LOG}", 15) + " && echo got", lambda o: o.endswith("got"), 30)
+    t.check("keyboard input routed to the focused client", wait_for("grep -q 'key 30' /tmp/probe1.log", 15) + " && echo got",
+            lambda o: o.endswith("got"), 30)
+    click(vm, cx, cy)
+    t.check("pointer button routed to the client", wait_for("grep -q 'button 272' /tmp/probe1.log", 15) + " && echo got",
+            lambda o: o.endswith("got"), 30)
     img = wait_screen(vm, RED)
-    t.expect_true("client re-rendered after the click", img.matches(*centre(img), RED),
-                  f"centre pixel {img.pixel(*centre(img))}")
+    t.expect_true("client re-rendered after input", img.matches(cx, cy, RED), f"{img.pixel(cx, cy)}")
 
-    # --- GPU API path (Mesa EGL + GLES2) ----------------------------------
-    start_probe(vm, "--fullscreen --egl")
-    t.check("EGL/GLES2 context through Mesa",
-            wait_for(f"grep -q 'drawn color={TEAL}' {PROBE_LOG}", 60) + f" && grep renderer= {PROBE_LOG}",
-            lambda o: "renderer=egl" in o and "gl_renderer=" in o, 90)
-    img = wait_screen(vm, TEAL, seconds=60)
-    t.expect_true("GLES-rendered frame reaches the screen", img.matches(*centre(img), TEAL),
-                  f"centre pixel {img.pixel(*centre(img))}")
-    vm.run("pkill -x gideon-gfx-probe")
+    # --- second client through Mesa EGL/GLES ---------------------------------------
+    start_probe(vm, "--egl", "/tmp/probe2.log")
+    ws = wait_until(lambda: (lambda l: l if len(l) == 2 else None)(ipc(vm, "windows")), 60, "second window")
+    w2 = next(w for w in ws if w["id"] != w1["id"])
+    t.check("EGL/GLES2 client through Mesa", wait_for(f"grep -q 'drawn color={TEAL}' /tmp/probe2.log", 60) + " && grep renderer= /tmp/probe2.log",
+            lambda o: "renderer=egl" in o, 90)
+    t.expect_true("new window takes focus and cascades", w2["focused"] and (w2["x"], w2["y"]) != (w1["x"], w1["y"]), f"{ws}")
+    time.sleep(1)
+    img = vm.screendump(0)
+    t.expect_true("GLES frame scanned out", img.matches(w2["x"] + w2["width"] // 2, w2["y"] + w2["height"] // 2, TEAL),
+                  f"{img.pixel(w2['x'] + w2['width'] // 2, w2['y'] + w2['height'] // 2)}")
 
-    # --- multiple displays -----------------------------------------------
+    # --- stacking, focus, moving with the pointer -------------------------------
+    click(vm, w1["x"] + 4, w1["y"] + 4)
+    t.expect_true("click raises and focuses the lower window",
+                  wait_until(lambda: next(w for w in ipc(vm, "windows") if w["id"] == w1["id"])["focused"], 10, "focus"))
+    bx, by = w1["x"] + 40, w1["y"] - 18
+    point(vm, bx, by)
+    vm.pointer_button(True)
+    point(vm, bx + 60, by + 30)
+    point(vm, bx + 120, by + 70)
+    vm.pointer_button(False)
+    time.sleep(0.3)
+    moved = next(w for w in ipc(vm, "windows") if w["id"] == w1["id"])
+    t.expect_true("title-bar drag moves the window", (moved["x"] - w1["x"], moved["y"] - w1["y"]) == (120, 70),
+                  f"moved by {moved['x'] - w1['x']},{moved['y'] - w1['y']}")
+
+    # --- keyboard shortcuts (docs/DESIGN.md §9) ----------------------------------
+    def focused():
+        return next(w for w in ipc(vm, "windows") if w["focused"])
+
+    vm.monitor("sendkey meta_l-up")
+    mx = wait_until(lambda: (lambda w: w if w["maximized"] and w["width"] == W else None)(focused()), 15, "maximize")
+    t.expect_true("Super+Up maximizes below the title bar", (mx["x"], mx["y"], mx["height"]) == (0, 36, H - 36), f"{mx}")
+    vm.monitor("sendkey meta_l-f")
+    fs = wait_until(lambda: (lambda w: w if w["fullscreen"] and w["height"] == H else None)(focused()), 15, "fullscreen")
+    img = vm.screendump(0)
+    t.expect_true("Super+F fullscreen covers the display (no title bar)",
+                  (fs["x"], fs["y"]) == (0, 0) and any(img.matches(5, 5, c) for c in (TEAL, AMBER, RED)), f"{fs} {img.pixel(5, 5)}")
+    vm.monitor("sendkey meta_l-f")
+    vm.monitor("sendkey meta_l-down")
+    wait_until(lambda: (lambda w: not w["maximized"] and not w["fullscreen"])(focused()), 15, "restore")
+    vm.monitor("sendkey meta_l-2")
+    wait_until(lambda: ipc(vm, "workspaces")["active"] == 2, 10, "workspace 2")
+    img = vm.screendump(0)
+    t.expect_true("Super+2 switches to an empty workspace", img.matches(W // 2, H // 2, BG), f"{img.pixel(W // 2, H // 2)}")
+    vm.monitor("sendkey meta_l-1")
+    wait_until(lambda: ipc(vm, "workspaces")["active"] == 1, 10, "workspace 1")
+    vm.monitor("sendkey meta_l-ret")
+    t.expect_true("Super+Enter launches the terminal (foot)",
+                  wait_until(lambda: any(w["app_id"] == "foot" for w in ipc(vm, "windows")), 60, "foot window"))
+    vm.monitor("sendkey print")
+    t.check("Print saves a PNG screenshot",
+            wait_for("ls /home/gideon/Pictures/Screenshot-*.png >/dev/null 2>&1", 20) + " && head -c 8 \"$(ls /home/gideon/Pictures/Screenshot-*.png | head -1)\" | od -c | head -1",
+            lambda o: "P   N   G" in o, 40)
+
+    # --- scaling, more modes ------------------------------------------------------
+    ipc(vm, "set-scale", name, 2)
+    start_probe(vm, "", "/tmp/probe3.log")
+    t.check("output scale 2 advertised to clients", wait_for("grep -q 'scale=2' /tmp/probe3.log", 30) + " && grep 'output name' /tmp/probe3.log | head -1",
+            lambda o: "scale=2" in o, 60)
+    ipc(vm, "set-scale", name, 1)
+    other = "800x600" if mode == "1024x768" else "1024x768"
+    ow, oh = map(int, other.split("x"))
+    ipc(vm, "set-mode", name, other)
+    img = wait_until(lambda: (lambda i: i if (i.width, i.height) == (ow, oh) else None)(vm.screendump(0)), 30, other)
+    t.expect_true(f"runtime mode change to {other}", (img.width, img.height) == (ow, oh))
+    ipc(vm, "set-mode", name, mode)
+
+    # --- multiple displays ---------------------------------------------------------
     if not vm.multihead:
         print("  SKIP multiple displays: Xvfb not installed (QEMU shows one head without a UI)")
-        return
-    t.expect_true("two displays exposed to clients", outputs == "outputs=2", f"probe saw {outputs!r}")
-    img1 = wait_screen(vm, BG, head=1, seconds=15)
-    t.expect_true("second display shows the desktop", img1.matches(*centre(img1), BG),
-                  f"head 1 centre pixel {img1.pixel(*centre(img1))} size {img1.width}x{img1.height}")
+    else:
+        outs = ipc(vm, "outputs")
+        t.expect_true("two displays driven, laid out side by side",
+                      len(outs) == 2 and outs[1]["x"] == outs[0]["x"] + outs[0]["width"], f"{outs}")
+        img1 = vm.screendump(1)
+        t.expect_true("second display shows the desktop", img1.matches(20, 20, BG), f"{img1.pixel(20, 20)}")
+
+    # --- VT switching (logind session pause/resume) -------------------------------
+    vm.monitor("sendkey ctrl-alt-f2")
+    t.check("Ctrl+Alt+F2 switches VT: compositor releases the display",
+            wait_for("grep -q 'session paused' /run/user/1000/gideon/compositor.log", 20) + " && echo paused", lambda o: o.endswith("paused"), 40)
+    vm.monitor("sendkey ctrl-alt-f1")
+    t.check("Ctrl+Alt+F1 returns: compositor resumes",
+            wait_for("grep -q 'session resumed' /run/user/1000/gideon/compositor.log", 20) + " && echo resumed", lambda o: o.endswith("resumed"), 40)
+    vm.run("pkill -x gideon-gfx-probe; pkill -x foot")
+    img = wait_screen(vm, BG, seconds=30)
+    t.expect_true("desktop redrawn after returning", img.matches(img.width // 2, img.height // 2, BG), f"{img.pixel(img.width // 2, img.height // 2)}")
 
 
 def mode_change_checks(t, vm):
-    """As root: change display mode + scale via gideon-config, restart the session."""
-    old = vm.run("pgrep -x weston")[1]
-    t.check("set display mode 1024x768 and scale 2",
-            "gideon-config set display.mode 1024x768 && gideon-config set display.scale 2 && echo set", lambda o: o.endswith("set"))
-    vm.run("pkill -x weston")
+    """As root: the configured startup mode applies when the session restarts."""
+    old = vm.run("pidof gideon-compositor")[1]
+    t.check("set display.mode 1024x768", "gideon-config set display.mode 1024x768 && echo set", lambda o: o.endswith("set"))
+    vm.run("kill $(pidof gideon-compositor)")
     t.check("graphical session restarts with the new settings",
-            wait_for(f"[ -n \"$(pgrep -x weston)\" ] && [ \"$(pgrep -x weston)\" != '{old}' ]", 60)
+            wait_for(f"[ -n \"$(pidof gideon-compositor)\" ] && [ \"$(pidof gideon-compositor)\" != '{old}' ]", 60)
             + " && echo restarted", lambda o: o.endswith("restarted"), 90)
-    vm.run(wait_for("ls /run/user/1000/wayland-? >/dev/null 2>&1", 30))
-    deadline = time.monotonic() + 60
-    while True:
-        img = vm.screendump(0)
-        if (img.width, img.height) == (1024, 768) or time.monotonic() > deadline:
-            break
-        time.sleep(2)
-    t.expect_true("display runs at 1024x768", (img.width, img.height) == (1024, 768), f"screen is {img.width}x{img.height}")
-    vm.run(f"runuser -u gideon -- sh -c '{WL}; gideon-gfx-probe > {PROBE_LOG} 2>&1 &'")
-    t.check("clients see the new mode and output scale 2",
-            wait_for(f"grep -q drawn {PROBE_LOG}", 30) + f" && grep 'output name' {PROBE_LOG} | head -1",
-            lambda o: "mode=1024x768" in o and "scale=2" in o, 60)
-    vm.run("pkill -x gideon-gfx-probe; gideon-config reset display.mode; gideon-config reset display.scale")
+    img = wait_until(lambda: (lambda i: i if (i.width, i.height) == (1024, 768) else None)(vm.screendump(0)), 60, "1024x768 at startup")
+    t.expect_true("display starts at the configured 1024x768", (img.width, img.height) == (1024, 768))
+    vm.run("gideon-config reset display.mode")
 
 
 def boot_and_check(iso, uefi, timeout, log_dir):
@@ -197,7 +304,7 @@ def boot_and_check(iso, uefi, timeout, log_dir):
                 "systemctl is-system-running --wait; systemctl --failed --no-legend --plain", lambda o: o.strip() == "running", 180)
         t.check("PID 1 is systemd", "cat /proc/1/comm", lambda o: o == "systemd")
         t.check("GideonOS kernel running", "uname -r", lambda o: o.endswith("-gideon"))
-        t.check("os-release identifies GideonOS 0.3", ". /etc/os-release; echo $ID $VERSION_ID", lambda o: o.startswith("gideonos 0.3"))
+        t.check("os-release identifies GideonOS 0.4", ". /etc/os-release; echo $ID $VERSION_ID", lambda o: o.startswith("gideonos 0.4"))
         t.check("root is an overlay on the read-only squashfs image",
                 "awk '$2==\"/\"{print $3} $2==\"/run/rootfs/lower\"{print $3}' /proc/mounts | sort | tr '\\n' ' '",
                 lambda o: o.split() == ["overlay", "squashfs"])
