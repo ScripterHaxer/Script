@@ -20,18 +20,20 @@ today** versus **planned**. If the two ever disagree, this file is wrong and mus
 │   (separate processes; Wayland layer-shell + gideon-shell protocol)  │
 ├──────────────────────────────────────────────────────────────────────┤
 │ Gideon Compositor            Rust + Smithay; window mgmt, input,     │  planned (M4)
-│                              outputs, decorations, IPC               │
+│                              outputs, decorations, IPC               │  (interim: Weston 14, M3)
 ├──────────────────────────────────────────────────────────────────────┤
-│ Wayland · DRM/KMS · GBM/EGL (Mesa) · libinput · libxkbcommon · libseat│  planned (M3)
+│ Wayland · DRM/KMS · GBM/EGL (Mesa) · libinput · libxkbcommon · libseat│  IMPLEMENTED (M3)
 ├──────────────────────────────────────────────────────────────────────┤
-│ Platform services   logging · devices · network · time · storage ·   │  IMPLEMENTED (M2, basic)
-│                     power button · users · sessions · config         │  D-Bus/audio/seat: M3+
+│ Platform services   udevd · journald · logind · networkd/resolved ·  │  IMPLEMENTED (M3, systemd)
+│                     timesyncd · D-Bus · automount · config-apply     │  audio/NetworkManager: later
 ├──────────────────────────────────────────────────────────────────────┤
-│ System init         BusyBox init + rc.boot + gideon-service (runsv)  │  IMPLEMENTED (M1–M2)
+│ System init         systemd 258 (PID 1)                              │  IMPLEMENTED (M3)
 ├──────────────────────────────────────────────────────────────────────┤
-│ Minimal userspace   static BusyBox 1.37.0                            │  IMPLEMENTED (M1)
+│ Userspace           glibc · BusyBox · util-linux · shadow · PAM,     │  IMPLEMENTED (M3)
+│                     built by Buildroot 2026.02 LTS (our BR2_EXTERNAL) │
 ├──────────────────────────────────────────────────────────────────────┤
-│ Linux 6.18 LTS      upstream source, x86_64_defconfig + fragment     │  IMPLEMENTED (M1)
+│ Linux 6.18 LTS      upstream source, x86_64_defconfig + fragment,    │  IMPLEMENTED (M1, modules M3)
+│                     modules + GPU firmware in the root image          │
 ├──────────────────────────────────────────────────────────────────────┤
 │ Bootloader          GRUB 2, hybrid BIOS + UEFI ISO                   │  IMPLEMENTED (M1)
 └──────────────────────────────────────────────────────────────────────┘
@@ -47,25 +49,28 @@ Firmware (UEFI/BIOS) → GRUB (Gideon theme, A/B slot selection)
  → gideon-shell processes → desktop ready
 ```
 
-### Current boot flow (milestone 2, verified in QEMU under BIOS and UEFI)
+### Current boot flow (milestone 3, verified in QEMU under BIOS and UEFI)
 
 ```
 GRUB (build/GideonOS.iso, El Torito BIOS + EFI) → /boot/vmlinuz + /boot/initramfs.img
- → initramfs /init (system/initramfs/init):
+ → initramfs /init (system/initramfs/init, static BusyBox):
      find the ISO9660 medium whose /gideon/rootfs.squashfs.sha256 matches the
      checksum built into this initramfs (optional full hash: gideon.verify=1)
      → mount squashfs read-only at /run/rootfs/lower
      → tmpfs /run/rootfs/rw → overlayfs at /newroot → switch_root
- → /sbin/init (BusyBox init) → /usr/lib/gideon/rc.boot:
-     kernel filesystems, hostname from config, mdev coldplug,
-     gideon-service boot  (devices, syslog, klog, clock, acpid, storage, network → dhcp@eth0, ntp)
- → getty → login (root refused on terminals) → session-setup (as root: /run/user/UID)
- → gideon-session (user's login shell; M3 turns this into the graphical session)
+ → systemd (PID 1): gideon-session-generator (tty1 autologin from session.autologin)
+     → gideon-config-apply (hostname, time zone, networkd + timesyncd config)
+     → udevd (devices, modules, firmware; removable media → gideon-automount@)
+     → journald, logind, networkd, resolved, timesyncd
+ → getty@tty1 (autologin, live image) → login (PAM: pam_systemd → logind session)
+ → gideon-session → graphical-session → Weston (DRM/KMS, libinput, libseat→logind)
+ → desktop (interim shell) on every connected output
+ Serial console: serial-getty@ttyS0 → login → gideon-session → text shell
 ```
 
 Boot options (kernel command line): `gideon.verify=1` (hash the root image before use),
 `gideon.break=premount|preinit` (rescue shell in the initramfs), `gideon.timeout=N` (seconds to
-wait for the boot medium), `gideon.debug=1` (trace rc.boot and service startup).
+wait for the boot medium). Standard systemd options (`systemd.unit=`, `systemd.debug_shell`) work too.
 
 ---
 
@@ -82,7 +87,9 @@ wait for the boot medium), `gideon.debug=1` (trace rc.boot and service startup).
 | Bootloader tools | grub-mkrescue, xorriso, mtools, grub-pc-bin, grub-efi-amd64-bin, OVMF installed via apt |
 | Kernel build deps | bc, bison, perl present; flex, libelf-dev, libssl-dev, cpio installed via apt |
 | Cross-compilers | none needed. Host and target are both x86_64 |
-| Wayland dev libraries | **not installed** (only pixman, udev .pc files). Needed from M3; will be built for the target, not taken from the host |
+| Wayland dev libraries | not installed initially. The target's are built by Buildroot. Host copies (libwayland-dev, wayland-protocols, EGL/GLES headers, weston) were installed only to compile-check and smoke-test `components/gfx-probe` |
+| Buildroot host tools | rsync, unzip, file, wget, patch, cpio, kmod (depmod) installed via apt |
+| Multi-display tests | Xvfb + QEMU's GTK UI module (`qemu-system-gui`): QEMU enables extra virtio-gpu heads only when a UI reports them |
 | Network | kernel.org and busybox.net reachable through the HTTPS proxy |
 
 `tools/check-deps.sh` reproduces these checks on any host and prints the exact package names
@@ -98,12 +105,15 @@ Each decision lists the alternatives and why they were rejected.
 * Linux **6.18.55 LTS**, pinned by URL + SHA-256 in `config/versions.env`.
 * Configuration: upstream `x86_64_defconfig` plus `config/kernel/gideon.config`. The build
   **fails** if Kconfig silently drops any fragment option, so the config cannot drift unnoticed.
-* M1 builds everything in (no modules). Real hardware (M3+) needs modules and
-  `linux-firmware`; the stage will then install modules into the root image.
+* VM-critical drivers (virtio, bochs/virtio-gpu, AHCI, NVMe, USB storage, HID) are built in.
+  Real-hardware GPU drivers (i915, amdgpu, nouveau) are **modules** (M3), installed into
+  `/usr/lib/modules` of the root image and loaded by udev after the root image, and its
+  `/usr/lib/firmware` (Buildroot `linux-firmware`: i915, amdgpu), is available.
+  The fragment also carries systemd's kernel requirements (cgroups, autofs, BPF, …).
 * No kernel fork. If patches ever become necessary they go in `kernel/patches/` with a stated
   reason.
 
-### D2. Base userspace: BusyBox now, Buildroot as the third-party build engine from M3
+### D2. Base userspace: BusyBox (M1–M2), Buildroot as the third-party build engine (M3, done)
 * **M1–M2**: a static BusyBox gives a complete, auditable minimal userspace (≈1 MB) with no libc
   runtime dependency.
 * **M3+** needs a real libc and a large graphics stack (Mesa, Wayland, libinput, libxkbcommon,
@@ -116,6 +126,17 @@ Each decision lists the alternatives and why they were rejected.
   everything* (maintenance burden); *Yocto* (much heavier than we need).
 * Buildroot builds images, not a package-managed system. That matches D5: the OS is an
   immutable image and applications are installed separately.
+* **Implemented (M3):** Buildroot **2026.02.3 LTS** (pinned + SHA-256) with the prebuilt Bootlin
+  x86-64 glibc toolchain (gcc 14). `system/buildroot/` holds:
+  * `configs/gideonos_x86_64_defconfig`: the package selection. The build fails if Kconfig
+    drops any line.
+  * `package/`: GideonOS packages (`gideon-gfx-probe` builds from `components/gfx-probe`).
+  * `board/gideonos/`: users table, a BusyBox fragment, `post-build.sh` (identity, kernel
+    modules, unit enablement, masks) and `post-fakeroot.sh` (reproducible password hashes,
+    ownership).
+
+  The Buildroot overlay is `system/rootfs/`. Our kernel, initramfs and ISO stages stay outside
+  Buildroot. Ownership and setuid bits are applied under fakeroot, so no root is needed.
 
 ### D3. Init and services
 * **M1–M2**: BusyBox `init` + `/usr/lib/gideon/rc.boot` + **`gideon-service`** (M2), a small
@@ -133,13 +154,30 @@ Each decision lists the alternatives and why they were rejected.
   * Services in M2: `devices` (mdev -d, netlink hotplug), `syslog`, `klog`, `clock` (RTC),
     `acpid` (power button), `storage` (removable media automount), `network`
     (link up, IPv6 SLAAC by the kernel, starts `dhcp@IF`), `dhcp@` (udhcpc), `ntp`.
-* **M3 recommendation: systemd** as PID 1, with udevd, logind, journald and timesyncd. The
-  graphical desktop needs seat and session management (libseat → logind), and PipeWire,
-  NetworkManager, polkit, UDisks2, UPower and Flatpak all integrate with it. Avoiding it would mean
-  re-solving these with less-tested replacements (eudev + seatd + elogind), which goes against
-  the rule *"do not sacrifice stability just to avoid existing Linux components."*
-  GideonOS services become systemd units, and the M2 rc scripts are retired at that point.
-  The switch happens at the start of M3 and is recorded here when it is made.
+* **M3, decided and implemented: systemd 258** as PID 1, with udevd, logind, journald,
+  networkd + resolved, timesyncd, hostnamed/timedated/localed and D-Bus. The graphical
+  desktop needs seat and session management (libseat → logind). PipeWire, NetworkManager,
+  polkit, UDisks2, UPower and Flatpak all integrate with it. Avoiding it would mean re-solving
+  these with less-tested replacements (eudev + seatd + elogind), which goes against
+  *"do not sacrifice stability just to avoid existing Linux components."*
+  M2's pieces were retired or ported:
+
+  | M2 | M3 |
+  |---|---|
+  | `gideon-service` + runsv | systemd units (`systemctl`), Restart= policies |
+  | mdev -d | systemd-udevd (+ hwdb) |
+  | syslogd + klogd | journald (volatile on the live image) |
+  | udhcpc + `dhcp@` | systemd-networkd, configured by `gideon-config-apply` |
+  | ntpd | systemd-timesyncd |
+  | acpid | logind `HandlePowerKey=poweroff` |
+  | login pre-setuid hook | `pam_systemd` / logind (`/run/user/UID`, seat, device ACLs) |
+  | `storage` service | udev rule → `gideon-automount@DEV.service` (BindsTo the device) |
+
+  GideonOS-specific units: `gideon-config-apply.service`, `gideon-automount@.service`,
+  `gideon-session-generator` (a systemd generator for tty1 autologin).
+  Masked: `systemd-networkd-persistent-storage.service`. When networkd crashes, its restart
+  job and this unit's restart wait on each other (found by the crash-restart test). The live
+  system keeps no persistent network state.
 
 ### D4. Graphics and compositor
 * DRM/KMS for modesetting, GBM + EGL/GLES (Mesa) for rendering, libinput for input,
@@ -155,6 +193,19 @@ Each decision lists the alternatives and why they were rejected.
   (would not be ours).
 * Development backend: Smithay's winit/nested backend lets the compositor run inside a window
   on a dev host. KMS backend in QEMU via `virtio-gpu`/`bochs` (already enabled in the kernel).
+* **M3 interim: Weston 14** (DRM backend, desktop shell) validates the whole stack until
+  gideon-compositor exists. It is launched by `/usr/lib/gideon/graphical-session` with a
+  `weston.ini` generated from `gideon-config` (`display.mode`, `display.scale`,
+  `display.renderer`, `display.background`, `input.keyboard_layout`, one `[output]` per
+  connected connector). If it fails within 15 s, the user gets a text shell and the log.
+  It is not the GideonOS desktop, and it is removed in M4.
+* **Mesa 26.0** drivers in the image: softpipe (CPU), virgl (VMs), nouveau, svga. **iris,
+  crocus, radeonsi and llvmpipe need LLVM**, because Mesa 26 compiles their OpenCL-C kernels with
+  it. LLVM is deferred for build cost (hours on this host), so modern Intel and AMD GPUs
+  currently have KMS and display, but no hardware GL. Buildroot 2026.02 does not mark crocus
+  as needing LLVM; Mesa's configure rejects it, and we drop it.
+* Renderer policy: the compositor uses **pixman** (CPU) by default. `display.renderer = "gl"`
+  opts into GPU composition. Clients can still use EGL/GLES (tested through Mesa on Wayland).
 
 ### D5. Filesystem and update model: image-based A/B system
 ```
@@ -170,7 +221,7 @@ Installed disk (GPT):
   slot, never half-updated.
 * Kernel and desktop updates are just new images. Applications (gpk, Flatpak) live on DATA and
   update independently.
-* **Implemented for the live ISO (M2):** the OS is a read-only, reproducible squashfs image
+* **Implemented for the live ISO (M2):** the OS is a read-only squashfs image
   (`/gideon/rootfs.squashfs`, zstd) and the initramfs puts a RAM overlay on top. Changes
   last until reboot. The initramfs accepts only the image whose SHA-256 it was built with.
   A full hash check before mounting is opt-in (`gideon.verify=1`, also a boot-menu entry,
@@ -204,8 +255,12 @@ One file per domain (`system.conf`, `time.conf`, `network.conf`, `logging.conf`,
 Rust components can parse the same files with a standard TOML parser later.
 **Implemented (M2):** `gideon-config get|set|reset|list [--user]`. Writes are atomic
 (temp file + rename), keys are validated, and `list` shows which layer each value comes from.
-Current consumers are hostname, time zone, RTC mode, NTP servers, DHCP, logging rotation and
-storage automount. Running components get live changes through compositor IPC or D-Bus (M4+).
+Current consumers (M3): hostname, time zone (zoneinfo names), network (DHCP, interfaces,
+send hostname → systemd-networkd), NTP servers (→ timesyncd), storage automount, display
+mode/scale/renderer/background and keyboard layout (graphical session), and session graphical
+mode and autologin. `gideon-config apply` (root) re-applies system settings live and restarts
+only the affected services. Display settings apply when the graphical session starts.
+Running components get live changes through compositor IPC or D-Bus (M4+).
 
 ### D8. Applications: `.gpk` + full Linux compatibility
 * A `.gpk` is a **declarative** archive: `manifest.toml` (id, version, arch, permissions,
@@ -222,7 +277,8 @@ storage automount. Running components get live changes through compositor IPC or
   **AppImage** are supported as-is. Wine/Proton is investigated later and never reimplemented.
 
 ### D9. Networking, audio, storage, power (M3+)
-NetworkManager (Wi-Fi via iwd or wpa_supplicant) with its D-Bus API driving our network UI;
+M3 uses systemd-networkd + resolved for wired networking (DHCPv4, IPv6 SLAAC, DNS stub).
+M9 adds NetworkManager (Wi-Fi via iwd or wpa_supplicant), whose D-Bus API drives our network UI;
 PipeWire + WirePlumber for audio; UDisks2 for removable drives in Files; UPower + logind for
 battery, suspend and power buttons. These are existing components. GideonOS writes the UI and the policy.
 
@@ -230,19 +286,24 @@ battery, suspend and power buttons. These are existing components. GideonOS writ
 Linux mechanisms only: users/groups (desktop user is non-root, in `wheel`), file permissions,
 polkit for privileged actions, capabilities for services, namespaces + seccomp (bubblewrap) for
 apps, signed OS images and packages, and Secure Boot (shim) later. AppArmor is evaluated in M11.
-**Current state (M2), what is actually implemented and tested:**
-* Accounts: `root` cannot log in on any terminal (empty `/etc/securetty`) and is reached with
-  `su`. The live user `gideon` (uid 1000, `wheel`) has a password. Password hashes are
-  SHA-512 crypt (BusyBox's default was DES and was changed). Live-image passwords are
-  public by design (`config/live.conf`) and must never reach an installed system.
-* `/etc/shadow` is 0600, homes are 0700, and the per-user runtime dir is created by root
-  (via `login`'s pre-setuid hook) as 0700, so it can't be squatted. Removable media is
-  mounted `nosuid,nodev`.
-* BusyBox is installed **setuid root** so `su`, `passwd` and `login` work. BusyBox drops
-  privileges for every applet not marked as needing them. This is a known trade-off of a
-  single multi-call binary and is reviewed in M11 (split setuid helpers or shadow-utils).
-* Not yet: polkit, capabilities for services (all run as root), sandboxing, signed images,
-  Secure Boot, firewall. None of these should be assumed.
+**Current state (M3), what is actually implemented and tested:**
+* Accounts: `root` cannot log in on any terminal. `/etc/securetty` is empty and
+  `pam_securetty noconsole` is set. Without `noconsole`, pam_securetty implicitly allows kernel
+  consoles such as `ttyS0`; an early M3 test caught exactly that. Root is reached with `su`
+  (util-linux, PAM). The live user `gideon` (uid 1000, `wheel`) logs in automatically on tty1
+  (live image only, `session.autologin`) and with a password elsewhere.
+  Hashes are SHA-512 crypt. Live-image passwords are public by design (`config/live.conf`) and
+  must never reach an installed system.
+* PAM: one `system-auth` stack. Account tools (useradd/usermod/chpasswd …) are root-only, and
+  anything without a policy hits `other` = deny. logind sessions come via `pam_systemd`.
+* Files: `/etc/shadow` 0600, homes 0700, `/run/user/UID` 0700 (logind). Removable media
+  is mounted `nosuid,nodev`. Device access goes through groups (`video`, `render`, `input`) plus
+  logind's seat ACLs.
+* setuid binaries: `su`, `passwd` and shadow's account tools (`BR2_PACKAGE_SHADOW_ACCOUNT_TOOLS_SETUID`).
+  BusyBox is no longer setuid.
+* Unprivileged users cannot manage services (no polkit rules: systemd denies). Tested.
+* Not yet: polkit rules for desktop actions, service sandboxing directives, app sandboxing,
+  signed images, Secure Boot, firewall, AppArmor. None of these should be assumed.
 
 ---
 
@@ -256,6 +317,8 @@ GideonOS/
 ├── system/rootfs/         files installed verbatim into the root filesystem
 │                          (/etc, /usr/lib/gideon/{rc.*,services/}, /usr/bin/gideon-*, …)
 ├── system/initramfs/      the initramfs /init (finds medium, mounts image, switch_root)
+├── system/buildroot/      BR2_EXTERNAL tree: defconfig, GideonOS packages, image hooks
+├── components/gfx-probe/  Wayland test client (wl_shm + EGL/GLES, input reporting)
 ├── tools/
 │   ├── lib/common.sh      shared build helpers (fetch + verify, stamps, reproducibility env)
 │   ├── build/*.sh         build stages: kernel, busybox, rootfs, initramfs, iso
@@ -267,7 +330,7 @@ GideonOS/
 
 Planned and created only when work on them begins (so there are no placeholder directories):
 `components/compositor`, `components/desktop`, `components/apps`, `components/ui` (gideon-ui),
-`components/gpk`, `components/update`, `components/installer`, `system/buildroot`, `kernel/patches`.
+`components/gpk`, `components/update`, `components/installer`, `kernel/patches`.
 
 The suggested top-level `kernel/` and `userspace/` directories became `config/kernel` and
 `system/`. We do not keep a kernel source tree or fork, only configuration. User-facing
@@ -279,39 +342,49 @@ components are grouped under `components/`.
 
 | Stage | Input | Output | Rebuilds when |
 |---|---|---|---|
-| kernel | Linux tarball (SHA-256 verified), `config/kernel/*` | `build/out/vmlinuz` | fragment, version or script changes |
-| busybox | BusyBox tarball (verified), `config/busybox/*` | `build/out/busybox` | same |
-| rootfs | `system/rootfs/`, BusyBox, `config/live.conf` | `build/out/rootfs.squashfs` (+ `.sha256`) | always (seconds) |
+| kernel | Linux tarball (SHA-256 verified), `config/kernel/*` | `build/out/vmlinuz`, `build/out/modules/` | fragment, version or script changes |
+| busybox | BusyBox tarball (verified), `config/busybox/*` | `build/out/busybox` (static: initramfs + build-time `cryptpw`) | same |
+| rootfs | Buildroot (verified) + `system/buildroot`, `system/rootfs/`, kernel modules, `config/live.conf` | `build/out/rootfs.squashfs` (+ `.sha256`) | packages once (≈1 h first build), then image only (≈1 min) |
 | initramfs | `system/initramfs/init`, BusyBox, root image checksum | `build/out/initramfs.img` | always (seconds) |
 | iso | kernel, initramfs, root image, `boot/grub` | `build/GideonOS.iso` | always (seconds) |
 
 Reproducibility measures: pinned and verified sources; `SOURCE_DATE_EPOCH` (from the last git
 commit) drives `KBUILD_BUILD_TIMESTAMP`, cpio mtimes and ISO file times; fixed build
 user/host; the cpio list is sorted and every file is owned by root regardless of the builder;
-`gzip -n`; mksquashfs with forced root ownership. The root image and the initramfs are
-bit-for-bit reproducible across rebuilds (tested). A full from-scratch ISO comparison has not
-been done yet.
+`gzip -n`; Buildroot's `BR2_REPRODUCIBLE`; reproducible password salts. Status: the initramfs is
+bit-for-bit reproducible (tested). Re-running the root image step on an existing Buildroot tree
+is bit-for-bit identical (tested twice in M3). **However**, the image from a from-scratch build
+differed from the one produced by the next incremental re-run. The cause is not investigated
+yet; it is an open item for M10 (updates need reproducible images).
 
-The whole build is designed to run **without root privileges**. Device nodes and ownership are
-declared in the cpio list (`gen_init_cpio`) and in mksquashfs actions/pseudo-definitions
-(root ownership, setuid BusyBox, user-owned home), not created on the host. (In this dev
-environment the build happens to run as root. Ownership forcing was tested with a
-non-root-owned source tree.)
+The whole build is designed to run **without root privileges**. Initramfs device nodes and
+ownership are declared in the cpio list (`gen_init_cpio`). Root-image ownership, setuid bits
+and the user table are applied by Buildroot under fakeroot (plus our `post-fakeroot.sh`).
+Nothing is created as root on the host. In this dev environment the build happens to run
+as root, so a fully unprivileged build has not been exercised since Buildroot was introduced.
 
 ## 6. Testing
 
 `tests/boot_test.py` (`./build.sh test`) boots the ISO in QEMU under **BIOS and UEFI (OVMF)**
-with a FAT-formatted USB stick attached and drives the serial console and QEMU monitor
-through 49 checks:
-* login policy, sessions and privilege boundaries
-* overlay/squashfs root
-* all services active, crash restart, stop/start
-* syslog + klogd
-* DHCP, default route, DNS, IPv6 SLAAC
-* config layering
+with a two-head virtio GPU, a USB tablet and a FAT USB stick. It drives the serial console
+and the QEMU monitor through 72 checks per firmware:
+* login policy, logind sessions and privilege boundaries
+* systemd state (no failed units), overlay/squashfs root, modules and firmware
+* graphics:
+  * compositor on DRM/KMS; libinput keyboard and pointer
+  * background and panel pixels, client frames via wl_shm and **EGL/GLES (Mesa)**
+  * **keyboard and pointer routing** proven by the client re-rendering
+  * **two displays**; **mode + scale change** through `gideon-config`
+* services: active, crash restart, stop/start; journal (user + kernel + logins)
+* DHCP, route, resolved DNS, IPv6 SLAAC
+* `gideon-config apply` (hostname, time zone)
 * user create/login/delete
 * USB coldplug, hotplug and unplug mounts
-* ACPI power-button shutdown
+* power-button shutdown via logind
 
-Assets (USB images) are created rootless with dosfstools/mtools. Serial logs go to
-`build/test-logs/`. The harness (`tests/lib/qemu.py`) is reused by later milestones.
+Screenshots come from the QEMU monitor (`screendump`, PPM) and are checked pixel by pixel
+against `docs/DESIGN.md` colour tokens. QEMU enables virtio-gpu heads beyond the first only
+when a UI reports them, so multi-display runs start QEMU's GTK UI on a private Xvfb
+(zoom-to-fit, so the guest's chosen mode is not overridden by the window size). Without Xvfb
+those checks are reported as SKIP, never as passed. Assets are created rootless, and serial
+logs go to `build/test-logs/`.

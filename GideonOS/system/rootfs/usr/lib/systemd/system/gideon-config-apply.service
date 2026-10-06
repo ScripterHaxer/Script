@@ -1,0 +1,14 @@
+[Unit]
+Description=Apply GideonOS configuration (hostname, time zone, network, time sync)
+Documentation=man:gideon-config
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target systemd-networkd.service systemd-timesyncd.service systemd-hostnamed.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/gideon/config-apply
+
+[Install]
+WantedBy=sysinit.target

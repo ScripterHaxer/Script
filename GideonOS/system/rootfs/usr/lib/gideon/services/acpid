@@ -1,3 +1,0 @@
-description="Power button and ACPI events"
-type=daemon
-exec="acpid -d -c /etc/acpi -a /etc/acpid.conf"

@@ -29,6 +29,15 @@ BUILD_DEPS=(
   "grub-efi|file|/usr/lib/grub/x86_64-efi/modinfo.sh|grub-efi-amd64-bin|grub2-efi-x64-modules|grub|UEFI boot support"
   "libelf|hdr|gelf.h|libelf-dev|elfutils-libelf-devel|libelf|kernel objtool"
   "openssl|hdr|openssl/opensslv.h|libssl-dev|openssl-devel|openssl|kernel certificate tools"
+  "depmod|cmd|depmod|kmod|kmod|kmod|kernel module index"
+  "g++|cmd|g++|g++|gcc-c++|gcc|Buildroot host tools"
+  "patch|cmd|patch|patch|patch|patch|Buildroot package patches"
+  "rsync|cmd|rsync|rsync|rsync|rsync|Buildroot"
+  "unzip|cmd|unzip|unzip|unzip|unzip|Buildroot"
+  "file|cmd|file|file|file|file|Buildroot"
+  "wget|cmd|wget|wget|wget|wget|Buildroot downloads"
+  "cpio|cmd|cpio|cpio|cpio|cpio|Buildroot"
+  "python3-build|cmd|python3|python3|python3|python|Buildroot (meson-based packages)"
 )
 RUN_DEPS=(
   "qemu|cmd|qemu-system-x86_64|qemu-system-x86|qemu-system-x86|qemu-system-x86|run.sh / boot tests"
@@ -36,6 +45,8 @@ RUN_DEPS=(
   "ovmf|file|/usr/share/ovmf/OVMF.fd|ovmf|edk2-ovmf|edk2-ovmf|UEFI boot in QEMU (optional)"
   "mkfs.vfat|cmd|mkfs.vfat|dosfstools|dosfstools|dosfstools|USB storage test images"
   "mcopy|cmd|mcopy|mtools|mtools|mtools|USB storage test images"
+  "xvfb|cmd|Xvfb|xvfb|xorg-x11-server-Xvfb|xorg-server-xvfb|multi-display tests (optional)"
+  "qemu-gtk|file|/usr/lib/x86_64-linux-gnu/qemu/ui-gtk.so|qemu-system-gui|qemu-ui-gtk|qemu-ui-gtk|multi-display tests (optional)"
 )
 
 probe() {
@@ -58,7 +69,7 @@ check_list() {
         pkg="$(cut -d'|' -f$col <<<"$entry")"
         if probe "$kind" "$probe_arg"; then
             ok "$name"
-        elif [[ "$name" == ovmf ]]; then
+        elif [[ "$why" == *"(optional"* ]]; then
             warn "$name missing (optional: $why) -> package: $pkg"; optional_missing=1
         else
             printf '%smissing%s %-14s needed for: %s -> package: %s\n' "$_c_err" "$_c_off" "$name" "$why" "$pkg" >&2

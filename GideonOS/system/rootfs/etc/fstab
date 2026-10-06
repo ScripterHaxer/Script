@@ -1,2 +1,3 @@
-# Kernel filesystems are mounted by /usr/lib/gideon/rc.boot.
+# The root filesystem is an overlay set up by the initramfs; systemd mounts
+# the API filesystems itself. Add local disks here.
 # <device> <mountpoint> <type> <options> <dump> <pass>

@@ -1,4 +1,0 @@
-description="Kernel log forwarder"
-requires="syslog"
-type=daemon
-exec="klogd -n"

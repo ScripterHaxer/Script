@@ -1,0 +1,10 @@
+[Unit]
+Description=Automount removable media /dev/%I
+BindsTo=dev-%i.device
+After=dev-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/gideon/storage-hotplug add %I
+ExecStop=/usr/lib/gideon/storage-hotplug remove %I

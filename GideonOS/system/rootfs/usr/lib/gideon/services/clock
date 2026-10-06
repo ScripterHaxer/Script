@@ -1,9 +1,0 @@
-description="Set system clock from the hardware clock"
-type=oneshot
-start() {
-    if [ "$(gideon-config get time.rtc_utc true)" = true ]; then hwclock -s -u; else hwclock -s -l; fi
-    echo "system clock: $(date -u)"
-}
-stop() {
-    if [ "$(gideon-config get time.rtc_utc true)" = true ]; then hwclock -w -u; else hwclock -w -l; fi
-}

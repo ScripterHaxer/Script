@@ -1,0 +1,9 @@
+# Fallback wired configuration; gideon-config-apply writes the effective one
+# to /run/systemd/network/80-gideon-wired.network (same name, takes priority).
+[Match]
+Type=ether
+Kind=!*
+
+[Network]
+DHCP=ipv4
+IPv6AcceptRA=yes

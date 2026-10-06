@@ -1,0 +1,9 @@
+config BR2_PACKAGE_GIDEON_GFX_PROBE
+	bool "gideon-gfx-probe"
+	depends on BR2_PACKAGE_WAYLAND
+	depends on BR2_PACKAGE_HAS_LIBEGL && BR2_PACKAGE_HAS_LIBGLES
+	select BR2_PACKAGE_WAYLAND_PROTOCOLS
+	help
+	  Wayland test client used by the GideonOS graphics tests:
+	  draws a known colour via wl_shm or EGL/GLES2 and reacts to
+	  keyboard and pointer input (components/gfx-probe).

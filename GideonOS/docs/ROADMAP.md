@@ -9,8 +9,8 @@ Status legend: **DONE** (built + tested) · **IN PROGRESS** · **PLANNED**
 |---|---|---|
 | M1 | Bootable minimal OS | **DONE** |
 | M2 | System foundation | **DONE** |
-| M3 | Graphical foundation | PLANNED (next) |
-| M4 | Gideon Compositor | PLANNED |
+| M3 | Graphical foundation | **DONE** |
+| M4 | Gideon Compositor | PLANNED (next) |
 | M5 | Gideon Desktop Shell | PLANNED |
 | M6 | System applications | PLANNED |
 | M7 | Application packaging (`gpk`) | PLANNED |
@@ -99,16 +99,61 @@ Status legend: **DONE** (built + tested) · **IN PROGRESS** · **PLANNED**
   resolves servers, but synchronisation itself is untested.
 * No Wi-Fi (M9). No firmware or modules for real hardware yet (M3).
 
-## M3 — Graphical foundation — PLANNED
+## M3 — Graphical foundation — DONE
 
-1. Decision checkpoint: switch init to systemd (D3) and record the result in ARCHITECTURE.md.
-2. Buildroot `BR2_EXTERNAL` tree (`system/buildroot/`) producing glibc, Mesa (virgl/llvmpipe),
-   libdrm, Wayland, wayland-protocols, libinput, libxkbcommon, seatd/logind, fonts.
-3. Kernel modules + firmware installed into the root image.
-4. Bring up an **existing** Wayland compositor (cage or weston kiosk) running a test client,
-   only to validate the stack: DRM/KMS, input, resolution changes, multiple QEMU heads.
-5. Tests: compositor starts on KMS in QEMU, a client renders, screenshot via QEMU monitor
-   (`screendump`) compared against expected colours.
+**Delivered** (GideonOS 0.3.0)
+1. **systemd 258** replaces BusyBox init and the M2 service framework (decision recorded in
+   ARCHITECTURE D3, with a mapping of every M2 piece to its replacement).
+2. **Buildroot 2026.02.3 LTS** builds the userspace through our `system/buildroot` external tree:
+   glibc (Bootlin toolchain), systemd, PAM, util-linux, shadow, Mesa 26.0, libdrm, Wayland
+   1.24, libinput, libxkbcommon, seatd/libseat (logind), fontconfig + DejaVu, Weston 14, tzdata,
+   linux-firmware (i915, amdgpu), and our `gideon-gfx-probe`.
+3. **Kernel modules** (i915, amdgpu, nouveau) and GPU firmware in the root image.
+4. **Graphical session**: the live user is logged in on tty1 and `gideon-session` starts the
+   interim compositor (Weston: DRM/KMS, libinput, libseat → logind) with GideonOS colours. A
+   failed compositor falls back to a text shell with its log.
+5. Display settings: `display.mode`, `display.scale`, `display.renderer`, `display.background`,
+   `input.keyboard_layout` (applied at session start). The `session.*` keys control the
+   graphical session and autologin.
+6. Ported and improved system pieces: networkd/resolved (DHCP, IPv6, DNS stub), timesyncd,
+   journald, logind power button, udev-driven USB automount, `gideon-config apply`, zoneinfo time
+   zones, `gideon-user` on shadow's tools, PAM stack.
+7. `components/gfx-probe`: Wayland test client (wl_shm and EGL/GLES2 paths, input reporting).
+8. **Tests**: 72 checks per firmware (BIOS + UEFI). They cover pixel-verified rendering via
+   CPU and EGL, keyboard/pointer routing, two displays, mode/scale changes, and all M2 checks
+   ported to systemd. `./run.sh` shows the desktop in a window (`--outputs 2` for two monitors).
+
+**Deviations from the plan**
+* Interim compositor: Weston (desktop shell) rather than cage/kiosk, because it gives a usable
+  terminal and launcher until M4. It is still only a stand-in.
+* Resolution changes are tested through configuration + session restart. *Runtime* output
+  reconfiguration (a protocol like wlr-output-management) belongs to gideon-compositor (M4).
+* Mesa hardware drivers for Intel (iris/crocus) and AMD (radeonsi) are **not included**: they
+  need LLVM (deferred; see ARCHITECTURE D4). Those GPUs get KMS display with CPU rendering.
+* The GPU stack could only be validated in QEMU (virtio-gpu). No physical hardware has been
+  tested.
+
+**Upstream issues found and handled**
+* `pam_securetty` silently allows kernel consoles (e.g. `console=ttyS0`) unless `noconsole` is
+  given. Root could log in on the serial console until the test caught it.
+* systemd-networkd + `systemd-networkd-persistent-storage.service`: after a networkd crash the
+  two restart jobs wait on each other (networkd stays down). The unit is masked on the live system.
+* Buildroot 2026.02 lets crocus be selected without LLVM; Mesa 26 then fails to configure.
+* Buildroot's default BusyBox config lacks `stat`, `timeout`, `pgrep`/`pkill` (enabled via
+  fragment). `getent` is not shipped with the external toolchain (scripts read /etc/passwd).
+* QEMU (headless) enables only the first virtio-gpu head. Multi-display tests run QEMU's GTK UI
+  on Xvfb with zoom-to-fit, otherwise the window size keeps overriding the guest's mode.
+* Our own bugs found by the tests: the probe lacked `wl_pointer` v5 handlers (libwayland aborted
+  it on the first pointer event), and its Makefile flags were overridden by Buildroot's
+  command-line `CFLAGS` (EGL silently compiled out).
+
+**Known limitations**
+* No hardware GL for Intel/AMD yet (LLVM). Weston composites with pixman by default.
+* First build takes about 1–1.5 h (Buildroot); the ISO is 106 MB (137 MB of firmware uncompressed).
+* Live system: changes in RAM only. Autologin is on (live image only).
+* No audio, no Wi-Fi, no polkit desktop authorization, no service sandboxing yet.
+* Root image reproducibility is only partial: a from-scratch build and a later incremental
+  rebuild produced different images (ARCHITECTURE §5). Investigate before M10.
 
 ## M4 — Gideon Compositor — PLANNED
 
@@ -123,7 +168,8 @@ Status legend: **DONE** (built + tested) · **IN PROGRESS** · **PLANNED**
     animations, vsync/presentation-time, keybinding config.
 11. JSON IPC socket and a headless backend for automated tests.
 
-Replaces the M3 interim compositor.
+Replaces the M3 interim compositor (Weston). The M3 test harness carries over: compositor startup,
+pixel checks, input routing via the QEMU monitor, multi-head via Xvfb, and gfx-probe as the client.
 
 ## M5 — Gideon Desktop Shell — PLANNED
 

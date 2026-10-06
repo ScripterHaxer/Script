@@ -1,6 +1,0 @@
-#!/bin/sh
-# getty -> login wrapper: registers the session-setup hook, which login runs
-# as root after authentication and before switching to the user.
-LOGIN_PRE_SUID_SCRIPT=/usr/lib/gideon/session-setup
-export LOGIN_PRE_SUID_SCRIPT
-exec /bin/login "$@"

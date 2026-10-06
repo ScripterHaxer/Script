@@ -1,0 +1,4 @@
+# Defaults for useradd (shadow). gideon-user passes shell, groups and home itself.
+SHELL=/usr/bin/gideon-session
+SKEL=/etc/skel
+CREATE_MAIL_SPOOL=no

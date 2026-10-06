@@ -5,9 +5,10 @@ source "$(dirname "$0")/../lib/common.sh"
 src="$SRC_DIR/linux-$LINUX_VERSION"
 obj="$BUILD_DIR/kernel-obj"
 out="$OUT_DIR/vmlinuz"
+mods="$OUT_DIR/modules"
 key="$(hash_inputs config/kernel tools/build/kernel.sh)-$LINUX_VERSION-$LINUX_SHA256"
 
-if stamp_ok kernel "$key" && [[ -f "$out" ]]; then ok "kernel up to date"; exit 0; fi
+if stamp_ok kernel "$key" && [[ -f "$out" && -d "$mods/lib/modules" ]]; then ok "kernel up to date"; exit 0; fi
 
 extract "$(fetch "$LINUX_URL" "$LINUX_SHA256")" "$src"
 mkdir -p "$obj" "$OUT_DIR"
@@ -31,10 +32,18 @@ done < "$GIDEON_ROOT/config/kernel/gideon.config"
 (( bad == 0 )) || die "kernel config fragment not fully applied (missing dependencies in fragment?)"
 
 log "Building kernel with $JOBS jobs (this takes a while)"
-make -C "$src" O="$obj" ARCH=x86_64 -j"$JOBS" bzImage > "$BUILD_DIR/kernel-build.log" 2>&1 \
+make -C "$src" O="$obj" ARCH=x86_64 -j"$JOBS" bzImage modules > "$BUILD_DIR/kernel-build.log" 2>&1 \
     || { tail -40 "$BUILD_DIR/kernel-build.log"; die "kernel build failed (full log: build/kernel-build.log)"; }
 
 cp "$obj/arch/x86/boot/bzImage" "$out"
+
+log "Installing kernel modules"
+command -v depmod >/dev/null || PATH="$PATH:/sbin:/usr/sbin"
+rm -rf "$mods"
+make -C "$src" O="$obj" ARCH=x86_64 INSTALL_MOD_PATH="$mods" INSTALL_MOD_STRIP=1 \
+    DEPMOD="$(command -v depmod)" modules_install >> "$BUILD_DIR/kernel-build.log" 2>&1 \
+    || { tail -20 "$BUILD_DIR/kernel-build.log"; die "modules_install failed"; }
+rm -f "$mods"/lib/modules/*/build "$mods"/lib/modules/*/source
 cp "$obj/.config" "$OUT_DIR/kernel.config"
 stamp_set kernel "$key"
-ok "kernel: $(make -s -C "$src" O="$obj" kernelrelease) -> build/out/vmlinuz"
+ok "kernel: $(make -s -C "$src" O="$obj" kernelrelease) -> build/out/vmlinuz ($(find "$mods" -name '*.ko' | wc -l) modules)"

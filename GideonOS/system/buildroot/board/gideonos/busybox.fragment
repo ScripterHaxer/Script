@@ -1,0 +1,11 @@
+# BusyBox inside the Buildroot root image (dynamic; coreutils-style applets).
+# login/su/passwd come from util-linux and shadow, which take precedence.
+CONFIG_FEATURE_DEFAULT_PASSWD_ALGO="sha512"
+# CONFIG_TC is not set
+# Applets GideonOS scripts and tests rely on (off in Buildroot's default config).
+CONFIG_STAT=y
+CONFIG_FEATURE_STAT_FORMAT=y
+CONFIG_FEATURE_STAT_FILESYSTEM=y
+CONFIG_TIMEOUT=y
+CONFIG_PGREP=y
+CONFIG_PKILL=y

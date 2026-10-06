@@ -1,0 +1,3 @@
+menu "GideonOS"
+source "$BR2_EXTERNAL_GIDEONOS_PATH/package/gideon-gfx-probe/Config.in"
+endmenu

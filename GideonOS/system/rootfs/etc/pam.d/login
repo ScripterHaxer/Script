@@ -1,0 +1,12 @@
+# Console login (util-linux login, also used by agetty --autologin via login -f).
+# Root may not log in on any terminal: /etc/securetty is empty, and
+# "noconsole" stops pam_securetty from implicitly allowing kernel consoles
+# (console= on the command line, e.g. ttyS0).
+auth      requisite pam_securetty.so noconsole
+auth      include   system-auth
+account   include   system-auth
+password  include   system-auth
+session   required  pam_env.so
+session   include   system-auth
+# Register the session with systemd-logind (seat, /run/user/UID, device access).
+session   optional  pam_systemd.so

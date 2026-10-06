@@ -1,9 +1,0 @@
-# GideonOS inittab (BusyBox init). Format: <tty>::<action>:<process>
-
-::sysinit:/usr/lib/gideon/rc.boot
-
-tty1::respawn:/usr/lib/gideon/console-getty tty1
-ttyS0::respawn:/usr/lib/gideon/console-getty ttyS0
-
-::ctrlaltdel:/sbin/reboot
-::shutdown:/usr/lib/gideon/rc.shutdown

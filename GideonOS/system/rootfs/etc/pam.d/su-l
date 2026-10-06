@@ -1,0 +1,6 @@
+# su: root may switch without a password; everyone else must know the target's.
+auth      sufficient pam_rootok.so
+auth      include    system-auth
+account   include    system-auth
+password  include    system-auth
+session   include    system-auth

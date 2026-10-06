@@ -1,0 +1,8 @@
+# Buildroot users table (makeusers format):
+# user uid group gid password home shell groups comment
+# Passwords here are placeholders; post-fakeroot.sh writes reproducible
+# SHA-512 hashes from config/live.conf.
+- -1 input  -1 * - - - Input devices
+- -1 render -1 * - - - GPU render nodes
+- -1 cdrom  -1 * - - - Optical drives
+gideon 1000 gideon 1000 =gideon /home/gideon /usr/bin/gideon-session wheel,users,audio,video,input,render,cdrom GideonOS Live User

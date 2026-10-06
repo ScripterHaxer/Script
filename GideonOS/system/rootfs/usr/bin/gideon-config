@@ -5,6 +5,7 @@
 #   gideon-config set KEY VALUE       write to /etc/gideon (machine) or ~/.config/gideon (--user)
 #   gideon-config reset KEY           remove the override, falling back to lower layers
 #   gideon-config list [DOMAIN]       effective values with the layer each comes from
+#   gideon-config apply               apply system settings now (root; also done at boot)
 #   options: --user   operate on the per-user layer
 #
 # KEY is DOMAIN.NAME, e.g. system.hostname -> file DOMAIN.conf, line NAME = VALUE.
@@ -118,6 +119,12 @@ case "$cmd" in
             printf '%-28s %-36s (%s)\n' "$key" "$("$0" $([ "$user" = 1 ] && echo --user) get "$key")" "$origin"
         done
         ;;
-    ''|-h|--help|help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+    apply)
+        [ "$(id -u)" = 0 ] || die "apply must be run as root"
+        /usr/lib/gideon/config-apply || exit 1
+        # Restart only what is running, so this is safe at any time.
+        systemctl try-reload-or-restart systemd-networkd.service systemd-timesyncd.service
+        ;;
+    ''|-h|--help|help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command '$cmd' (try --help)" ;;
 esac

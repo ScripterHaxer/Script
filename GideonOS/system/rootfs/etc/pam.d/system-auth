@@ -1,0 +1,6 @@
+# GideonOS common PAM stack, included by the service files in /etc/pam.d.
+auth      required  pam_unix.so
+account   required  pam_unix.so
+password  required  pam_unix.so sha512 shadow
+session   required  pam_limits.so
+session   required  pam_unix.so

@@ -1,0 +1,9 @@
+# Removable or USB block devices carrying a filesystem are mounted under
+# /media/<label> by gideon-automount@.service and unmounted when unplugged.
+SUBSYSTEM!="block", GOTO="gideon_automount_end"
+ACTION!="add", GOTO="gideon_automount_end"
+ENV{ID_FS_USAGE}!="filesystem", GOTO="gideon_automount_end"
+ENV{ID_BUS}=="usb", ENV{GIDEON_AUTOMOUNT}="1"
+ATTRS{removable}=="1", ENV{GIDEON_AUTOMOUNT}="1"
+ENV{GIDEON_AUTOMOUNT}=="1", TAG+="systemd", ENV{SYSTEMD_WANTS}+="gideon-automount@%k.service"
+LABEL="gideon_automount_end"

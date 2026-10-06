@@ -1,0 +1,80 @@
+#!/bin/sh
+# gideon-user: manage GideonOS user accounts (wraps shadow's tools).
+#
+#   gideon-user add NAME [--admin] [--fullname "Full Name"]
+#   gideon-user del NAME [--keep-home]
+#   gideon-user passwd NAME [--stdin]     (--stdin reads one line: the new password)
+#   gideon-user list
+#
+# Regular users get uid >= 1000, a private home (0700), the gideon-session
+# login shell, and the desktop groups (users audio video input render cdrom).
+# --admin adds them to wheel (allowed to administer the system).
+set -eu
+PATH=/usr/bin:/usr/sbin
+DESKTOP_GROUPS="users,audio,video,input,render,cdrom"
+
+die() { echo "gideon-user: $*" >&2; exit 2; }
+need_root() { [ "$(id -u)" = 0 ] || die "must be run as root (try: su -c 'gideon-user ...')"; }
+valid() { echo "$1" | grep -Eq '^[a-z_][a-z0-9_-]{0,30}$' || die "invalid user name '$1' (lowercase letters, digits, _ and -)"; }
+# Accounts live in /etc/passwd only (no other NSS user databases).
+exists() { awk -F: -v u="$1" '$1 == u { f = 1 } END { exit !f }' /etc/passwd; }
+uid_of() { awk -F: -v u="$1" '$1 == u { print $3 }' /etc/passwd; }
+regular() { u="$(uid_of "$1")"; [ -n "$u" ] && [ "$u" -ge 1000 ] && [ "$u" -lt 65534 ]; }
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+    add)
+        need_root; [ $# -ge 1 ] || die "usage: add NAME [--admin] [--fullname NAME]"
+        name="$1"; shift; admin=no; full="$name"
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --admin) admin=yes ;;
+                --fullname) [ $# -ge 2 ] || die "--fullname needs a value"; full="$2"; shift ;;
+                *) die "unknown option '$1'" ;;
+            esac; shift
+        done
+        valid "$name"; exists "$name" && die "user '$name' already exists"
+        case "$full" in *:*) die "full name may not contain ':'" ;; esac
+        groups="$DESKTOP_GROUPS"; [ "$admin" = yes ] && groups="$groups,wheel"
+        useradd --create-home --user-group --shell /usr/bin/gideon-session \
+                --comment "$full" --groups "$groups" "$name"
+        chmod 0700 "/home/$name"
+        logger -t gideon-user "added user $name (uid $(uid_of "$name"), admin=$admin)"
+        echo "Created user '$name' (uid $(uid_of "$name")). Set a password with: gideon-user passwd $name"
+        ;;
+    del)
+        need_root; [ $# -ge 1 ] || die "usage: del NAME [--keep-home]"
+        name="$1"; keep=no; [ "${2:-}" = --keep-home ] && keep=yes
+        valid "$name"; exists "$name" || die "no such user '$name'"
+        regular "$name" || die "refusing to delete system account '$name'"
+        if loginctl show-user "$name" >/dev/null 2>&1 && \
+           [ -n "$(loginctl show-user "$name" -p Sessions --value 2>/dev/null)" ]; then
+            die "user '$name' is logged in"
+        fi
+        if [ "$keep" = yes ]; then userdel "$name"; else userdel --remove "$name" 2>/dev/null || userdel --remove "$name"; fi
+        logger -t gideon-user "deleted user $name"
+        echo "Deleted user '$name'."
+        ;;
+    passwd)
+        [ $# -ge 1 ] || die "usage: passwd NAME [--stdin]"
+        name="$1"; valid "$name"; exists "$name" || die "no such user '$name'"
+        if [ "${2:-}" = --stdin ]; then
+            need_root
+            IFS= read -r pw || die "no password on stdin"
+            [ -n "$pw" ] || die "empty password"
+            case "$pw" in *:*) die "password may not contain ':'" ;; esac
+            printf '%s:%s\n' "$name" "$pw" | chpasswd
+        else
+            exec passwd "$name"
+        fi
+        ;;
+    list)
+        printf '%-12s %-6s %-6s %s\n' USER UID ADMIN NAME
+        awk -F: '$3>=1000 && $3<65534 { print $1, $3, $5 }' /etc/passwd | while read -r u id full; do
+            adm=no; id -nG "$u" | tr ' ' '\n' | grep -qx wheel && adm=yes
+            printf '%-12s %-6s %-6s %s\n' "$u" "$id" "$adm" "$full"
+        done
+        ;;
+    ''|-h|--help|help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown command '$cmd' (try --help)" ;;
+esac
