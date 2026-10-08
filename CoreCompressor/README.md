@@ -4,6 +4,14 @@ Packs files and folders into one smaller archive. When you extract it, every fil
 
 ![The Core Compressor window](screenshot.png)
 
+## Windows program (.exe)
+
+**Core Compressor.exe** is a single file that runs on Windows 10 and 11 without installing Python or anything else. Double-click it to open the window. It's about 11 MB because Python is packed inside it.
+
+Because the .exe isn't signed with a paid certificate, Windows SmartScreen may show "Windows protected your PC" the first time you run it. Click **More info**, then **Run anyway**. Some antivirus programs are also cautious with PyInstaller-made programs. You can check the file against its SHA-256 fingerprint if you want to make sure it hasn't changed.
+
+To build the .exe yourself (for example after changing the code), install Python from python.org, then double-click **`build_exe.bat`** in this folder. The new .exe appears in the `dist` folder.
+
 ## How to use
 
 You need Python 3.8 or newer (get it from [python.org](https://www.python.org/downloads/)). Nothing else has to be installed.

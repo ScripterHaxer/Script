@@ -1073,6 +1073,12 @@ def run_gui():
         root = tk.Tk()
 
     root.title("Core Compressor")
+    if sys.platform == "win32":  # window and taskbar icon (bundled inside the .exe)
+        here = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        try:
+            root.iconbitmap(os.path.join(here, "core_compressor.ico"))
+        except tk.TclError:
+            pass
     root.geometry("860x640")
     root.minsize(680, 520)
 
@@ -1340,7 +1346,7 @@ def run_gui():
     dest_row, dest_var = path_row(xtab, "Extract to:", browse_dest)
     dest_row.pack(fill="x", pady=(8, 0))
 
-    xinfo = ttk.Label(xtab, text="Choose an archive to see what is inside.", style="Hint.TLabel")
+    xinfo = ttk.Label(xtab, text="", style="Hint.TLabel")
     xinfo.pack(fill="x", pady=(12, 0))
     xtree_frame, xtree = make_tree(xtab, [("name", "Name"), ("size", "Size")], [500, 120])
 
@@ -1480,15 +1486,15 @@ def run_gui():
     combo_setting(box, 1, "CPU cores:", cores_var, list(core_names))
     box = section("Organize")
     combo_setting(box, 0, "Sort files:", sort_var, list(sort_names),
-                  hint="Your original files are not moved.")
+                  hint="")
     check_setting(box, 1, "Skip duplicate files", dedupe_var,
-                  hint="Identical files are stored only once.")
+                  hint="")
     box = section("Downloads")
     check_setting(box, 0, "Fast download (3 files at once, 4 connections per file)", fast_dl_var)
     check_setting(box, 1, "Also keep the uncompressed files", keep_var)
     box = section("General")
     check_setting(box, 0, "Remember settings", remember_var,
-                  hint="Your choices are kept for the next time you open the program.")
+                  hint="")
 
     defaults = {
         "level": "best", "cores": "all", "sort": "none", "skip_duplicates": False,
